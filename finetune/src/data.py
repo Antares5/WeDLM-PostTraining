@@ -408,7 +408,7 @@ def get_im_end_token_id(tokenizer: PreTrainedTokenizer) -> int:
         tokens = tokenizer.encode("<|im_end|>", add_special_tokens=False)
         if tokens:
             return tokens[0]
-    except:
+    except Exception:
         pass
     
     if hasattr(tokenizer, 'added_tokens_encoder'):
