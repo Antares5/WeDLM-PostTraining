@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_IM_END_TOKEN_ID = 151645
 PACKING_ALGO_VERSION = "v2_no_discard"
 
+DEEPMATH_ANSWER_FIELD_CANDIDATES = [
+    "final_answer",
+    "answer",
+    "ground_truth",
+    "target",
+    "label",
+    "solution",
+]
+
 
 @dataclass
 class PackedBatch:
@@ -581,6 +590,188 @@ class WeDLMPairwiseDataset(Dataset):
         }
 
 
+class WeDLMPromptDataset(Dataset):
+    """Prompt-only dataset for online GSPO rollouts.
+
+    Supported JSONL formats per line:
+    1) [{"role": ..., "content": ...}, ...]              # chat conversation
+    2) {"messages": [...]}                                 # wrapped conversation
+    3) {"prompt": ..., "chosen": ..., "rejected": ...}  # pairwise-style item
+    4) {"question"|"instruction"|"input"|"system": ...}
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        tokenizer: PreTrainedTokenizer,
+        max_prompt_length: int = 1536,
+    ):
+        self.tokenizer = tokenizer
+        self.max_prompt_length = max_prompt_length
+        self.samples = self._load_and_tokenize_prompts(data_path)
+        logger.info(f"Loaded {len(self.samples)} prompt samples from {data_path}")
+
+    def _to_messages(self, value: Any, default_role: str) -> Optional[List[Dict[str, str]]]:
+        if isinstance(value, str):
+            return [{"role": default_role, "content": value}]
+
+        if isinstance(value, list):
+            if all(isinstance(item, dict) and "role" in item and "content" in item for item in value):
+                return value
+
+        return None
+
+    def _normalize_text(self, value: Any) -> Optional[str]:
+        if isinstance(value, str):
+            normalized = value.strip()
+            return normalized if len(normalized) > 0 else None
+
+        return None
+
+    def _build_prompt_messages_from_item(self, item: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
+        prompt_messages: List[Dict[str, str]] = []
+
+        system_text = self._normalize_text(item.get("system"))
+        if system_text is not None:
+            prompt_messages.append({"role": "system", "content": system_text})
+
+        user_text = self._normalize_text(item.get("question"))
+        if user_text is None:
+            user_text = self._normalize_text(item.get("problem"))
+        if user_text is None:
+            user_text = self._normalize_text(item.get("prompt"))
+
+        if user_text is None:
+            instruction_text = self._normalize_text(item.get("instruction"))
+            input_text = self._normalize_text(item.get("input"))
+            if instruction_text is not None and input_text is not None:
+                user_text = f"{instruction_text}\n\n{input_text}"
+            elif instruction_text is not None:
+                user_text = instruction_text
+            elif input_text is not None:
+                user_text = input_text
+
+        if user_text is not None:
+            prompt_messages.append({"role": "user", "content": user_text})
+
+        return prompt_messages if len(prompt_messages) > 0 else None
+
+    def _extract_prompt_metadata(self, item: Any) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {}
+        if not isinstance(item, dict):
+            return metadata
+
+        for field in DEEPMATH_ANSWER_FIELD_CANDIDATES:
+            value = self._normalize_text(item.get(field))
+            if value is not None:
+                metadata["ground_truth_answer"] = value
+                metadata["ground_truth_field"] = field
+                break
+
+        for field in ["dataset", "source", "subject", "type", "level"]:
+            value = item.get(field)
+            if isinstance(value, str) and value.strip():
+                metadata[field] = value.strip()
+
+        return metadata
+
+    def _extract_prompt_messages(self, item: Any) -> Optional[List[Dict[str, str]]]:
+        # Pure chat-format conversation lines.
+        if isinstance(item, list):
+            messages = self._to_messages(item, "user")
+            if messages is None:
+                return None
+            if len(messages) > 1:
+                return messages[:-1]
+            return messages
+
+        if not isinstance(item, dict):
+            return None
+
+        # Wrapped conversation under "messages".
+        if "messages" in item:
+            messages = self._to_messages(item.get("messages"), "user")
+            if messages is not None:
+                if len(messages) > 1:
+                    return messages[:-1]
+                return messages
+
+        # Direct prompt fields.
+        prompt_messages = self._to_messages(item.get("prompt"), "user") if "prompt" in item else None
+        if prompt_messages is None:
+            prompt_messages = self._build_prompt_messages_from_item(item)
+        if prompt_messages is not None and len(prompt_messages) > 0:
+            return prompt_messages
+
+        # Fallback: pairwise-style "chosen" full conversation.
+        chosen_messages = self._to_messages(item.get("chosen"), "assistant")
+        if chosen_messages is not None and len(chosen_messages) > 0:
+            if chosen_messages[0].get("role") in {"user", "system"}:
+                if len(chosen_messages) > 1:
+                    return chosen_messages[:-1]
+                return chosen_messages
+
+        return None
+
+    def _tokenize_prompt_messages(self, messages: List[Dict[str, str]]) -> Optional[torch.Tensor]:
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_ids = self.tokenizer.encode(
+            prompt_text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_prompt_length,
+        )
+        if len(prompt_ids) == 0:
+            return None
+        return torch.tensor(prompt_ids, dtype=torch.long)
+
+    def _load_and_tokenize_prompts(self, data_path: str) -> List[Dict[str, Any]]:
+        samples: List[Dict[str, Any]] = []
+
+        with open(data_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Skipping line {line_num}: JSON decode error - {e}")
+                    continue
+
+                prompt_messages = self._extract_prompt_messages(item)
+                if prompt_messages is None or len(prompt_messages) == 0:
+                    logger.warning(f"Skipping line {line_num}: unable to extract prompt messages")
+                    continue
+
+                prompt_ids = self._tokenize_prompt_messages(prompt_messages)
+                if prompt_ids is None:
+                    logger.warning(f"Skipping line {line_num}: empty prompt after tokenization")
+                    continue
+
+                samples.append(
+                    {
+                        "prompt_input_ids": prompt_ids,
+                        "prompt_metadata": self._extract_prompt_metadata(item),
+                    }
+                )
+
+        return samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample = self.samples[idx]
+        return {
+            "prompt_input_ids": sample["prompt_input_ids"].clone(),
+            "prompt_metadata": dict(sample["prompt_metadata"]),
+        }
+
+
 def packed_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """Collate function for packed dataset.
     
@@ -648,6 +839,18 @@ def dpo_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tens
         "rejected_packed_labels": rejected_packed_labels,
         "rejected_cum_seqlens": rejected_cum_seqlens,
         "pair_size": torch.tensor(len(batch), dtype=torch.long),
+    }
+
+
+def gspo_prompt_collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate function for online GSPO prompt batches."""
+    if len(batch) == 0:
+        raise ValueError("Empty batch in gspo_prompt_collate_fn")
+
+    return {
+        "prompt_input_ids": [item["prompt_input_ids"] for item in batch],
+        "prompt_metadata": [item.get("prompt_metadata", {}) for item in batch],
+        "prompt_count": torch.tensor(len(batch), dtype=torch.long),
     }
 
 

@@ -7,7 +7,7 @@ train_data: "data/alpaca_cleaned_sft.jsonl"
 max_seq_length: 2048
 
 # Mode
-training_mode: "dpo"  # "sft" or "dpo"
+training_mode: "dpo"  # "sft", "dpo" or "gspo"
 
 # DPO scaffold (increment 1/2)
 dpo_train_data: "data/pairwise_train.jsonl"
@@ -17,8 +17,29 @@ dpo_length_norm: true
 dpo_block_reduce: "mean"
 dpo_seq_reduce: "mean"
 dpo_num_mask_samples: 4
-dpo_enable_ar_anchor: false
-dpo_ar_loss_weight: 0.05
+
+# Online GSPO
+gspo_train_data: null
+gspo_ref_model_path: null
+gspo_group_size: 4
+gspo_min_candidates_per_group: 2
+gspo_max_prompt_length: 1536
+gspo_max_new_tokens: 256
+gspo_rollout_temperature: 0.8
+gspo_rollout_top_p: 0.95
+gspo_rollout_top_k: 0
+gspo_score_temperature: 1.0
+gspo_reward_temperature: 1.0
+gspo_ref_alpha: 1.0
+gspo_kl_coef: 0.0
+gspo_reward_beta: 0.1
+gspo_reward_source: "policy_ref_margin"  # policy_ref_margin | length_penalized_margin | deepmath_correctness_margin | callable
+gspo_reward_length_penalty: 0.0
+gspo_reward_callable: null  # e.g. my_reward_module:compute_reward
+gspo_reward_clip_min: null
+gspo_reward_clip_max: null
+gspo_deepmath_correct_bonus: 1.0
+gspo_deepmath_wrong_penalty: 0.0
 
 # WeDLM
 block_size: 32

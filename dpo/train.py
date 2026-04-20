@@ -24,12 +24,14 @@ def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="WeDLM SFT Training")
     parser.add_argument("--config", type=str, default=None, help="Path to config YAML file")
-    parser.add_argument("--training_mode", type=str, choices=["sft", "dpo"], default=None,
-                        help="Training mode: sft or dpo")
+    parser.add_argument("--training_mode", type=str, choices=["sft", "dpo", "gspo"], default=None,
+                        help="Training mode: sft, dpo or gspo")
     parser.add_argument("--model_path", type=str, default=None, help="Override model path")
     parser.add_argument("--train_data", type=str, default=None, help="Override training data path")
     parser.add_argument("--dpo_train_data", type=str, default=None,
                         help="Override DPO pairwise training data path")
+    parser.add_argument("--gspo_train_data", type=str, default=None,
+                        help="Override GSPO prompt data path")
     parser.add_argument("--output_dir", type=str, default=None, help="Override output directory")
     parser.add_argument("--attention_backend", type=str, choices=["magi", "dense"], default=None,
                         help="Attention backend: magi or dense")
@@ -45,6 +47,56 @@ def parse_args():
                         help="Number of mask Monte Carlo samples for DPO scoring")
     parser.add_argument("--dpo_length_norm", action=argparse.BooleanOptionalAction, default=None,
                         help="Enable length normalization in DPO scoring")
+    parser.add_argument("--gspo_ref_model_path", type=str, default=None,
+                        help="Reference model path for GSPO")
+    parser.add_argument("--gspo_group_size", type=int, default=None,
+                        help="Number of online candidates sampled per prompt")
+    parser.add_argument("--gspo_min_candidates_per_group", type=int, default=None,
+                        help="Minimum valid candidates required for each prompt group")
+    parser.add_argument("--gspo_max_prompt_length", type=int, default=None,
+                        help="Maximum prompt length for GSPO prompt dataset")
+    parser.add_argument("--gspo_max_new_tokens", type=int, default=None,
+                        help="Maximum new tokens during GSPO online rollout")
+    parser.add_argument("--gspo_rollout_temperature", type=float, default=None,
+                        help="Sampling temperature for GSPO online rollout")
+    parser.add_argument("--gspo_rollout_top_p", type=float, default=None,
+                        help="Top-p for GSPO online rollout")
+    parser.add_argument("--gspo_rollout_top_k", type=int, default=None,
+                        help="Top-k for GSPO online rollout")
+    parser.add_argument("--gspo_score_temperature", type=float, default=None,
+                        help="Temperature for GSPO policy distribution over group candidates")
+    parser.add_argument("--gspo_reward_temperature", type=float, default=None,
+                        help="Temperature for GSPO target reward distribution")
+    parser.add_argument("--gspo_ref_alpha", type=float, default=None,
+                        help="Reference score coefficient in GSPO policy logits")
+    parser.add_argument("--gspo_kl_coef", type=float, default=None,
+                        help="KL regularization coefficient for GSPO")
+    parser.add_argument("--gspo_reward_beta", type=float, default=None,
+                        help="Reward scaling beta for GSPO")
+    parser.add_argument(
+        "--gspo_reward_source",
+        type=str,
+        choices=[
+            "policy_ref_margin",
+            "length_penalized_margin",
+            "deepmath_correctness_margin",
+            "callable",
+        ],
+        default=None,
+        help="GSPO reward function source",
+    )
+    parser.add_argument("--gspo_reward_length_penalty", type=float, default=None,
+                        help="Linear length penalty coefficient for GSPO reward")
+    parser.add_argument("--gspo_reward_callable", type=str, default=None,
+                        help="Reward callable path in the form module:function")
+    parser.add_argument("--gspo_reward_clip_min", type=float, default=None,
+                        help="Optional min clip for GSPO reward")
+    parser.add_argument("--gspo_reward_clip_max", type=float, default=None,
+                        help="Optional max clip for GSPO reward")
+    parser.add_argument("--gspo_deepmath_correct_bonus", type=float, default=None,
+                        help="Correctness bonus for deepmath_correctness_margin reward")
+    parser.add_argument("--gspo_deepmath_wrong_penalty", type=float, default=None,
+                        help="Wrong-answer penalty for deepmath_correctness_margin reward")
     parser.add_argument("--rebuild_cache", action="store_true", help="Rebuild data cache")
     return parser.parse_args()
 
@@ -62,6 +114,7 @@ def main():
         "model_path",
         "train_data",
         "dpo_train_data",
+        "gspo_train_data",
         "output_dir",
         "attention_backend",
         "loss_weighting_scheme",
@@ -71,6 +124,26 @@ def main():
         "dpo_seq_reduce",
         "dpo_num_mask_samples",
         "dpo_length_norm",
+        "gspo_ref_model_path",
+        "gspo_group_size",
+        "gspo_min_candidates_per_group",
+        "gspo_max_prompt_length",
+        "gspo_max_new_tokens",
+        "gspo_rollout_temperature",
+        "gspo_rollout_top_p",
+        "gspo_rollout_top_k",
+        "gspo_score_temperature",
+        "gspo_reward_temperature",
+        "gspo_ref_alpha",
+        "gspo_kl_coef",
+        "gspo_reward_beta",
+        "gspo_reward_source",
+        "gspo_reward_length_penalty",
+        "gspo_reward_callable",
+        "gspo_reward_clip_min",
+        "gspo_reward_clip_max",
+        "gspo_deepmath_correct_bonus",
+        "gspo_deepmath_wrong_penalty",
     ]:
         if getattr(args, key, None) is not None:
             setattr(config, key, getattr(args, key))
