@@ -1,66 +1,17 @@
 # coding=utf-8
-"""Reward interfaces for online GSPO training."""
+"""DeepMath reward combining margin shaping and exact-match correctness.
+Migrated from dpo/src/reward.py (DeepMathCorrectnessMarginReward + answer extraction)."""
 
-from dataclasses import dataclass
 from fractions import Fraction
-import importlib
 import math
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+from .base import BaseRewardFunction, RewardInputs
 
 
-@dataclass
-class RewardInputs:
-    """Container for GSPO reward function inputs."""
-
-    prompt_input_ids: List[torch.Tensor]
-    candidate_input_ids: List[torch.Tensor]
-    candidate_labels: List[torch.Tensor]
-    completion_lengths: List[int]
-    group_ids: torch.Tensor
-    policy_scores: torch.Tensor
-    reference_scores: torch.Tensor
-    tokenizer: object
-    prompt_metadata: Optional[List[Dict[str, Any]]] = None
-    candidate_completion_ids: Optional[List[torch.Tensor]] = None
-    candidate_completion_texts: Optional[List[str]] = None
-
-
-class BaseRewardFunction:
-    """Base class for reward functions."""
-
-    def __call__(self, inputs: RewardInputs) -> torch.Tensor:
-        raise NotImplementedError
-
-
-class PolicyRefMarginReward(BaseRewardFunction):
-    """Default reward: beta * (policy_score - reference_score)."""
-
-    def __init__(self, beta: float):
-        self.beta = float(beta)
-
-    def __call__(self, inputs: RewardInputs) -> torch.Tensor:
-        return self.beta * (inputs.policy_scores.detach() - inputs.reference_scores.detach())
-
-
-class LengthPenalizedMarginReward(BaseRewardFunction):
-    """Margin reward with a linear completion-length penalty."""
-
-    def __init__(self, beta: float, length_penalty: float):
-        self.beta = float(beta)
-        self.length_penalty = float(length_penalty)
-
-    def __call__(self, inputs: RewardInputs) -> torch.Tensor:
-        base_reward = self.beta * (inputs.policy_scores.detach() - inputs.reference_scores.detach())
-        lengths = torch.tensor(
-            inputs.completion_lengths,
-            dtype=base_reward.dtype,
-            device=base_reward.device,
-        )
-        return base_reward - self.length_penalty * lengths
-
+# ── Answer extraction utilities ──────────────────────────────
 
 _BOOL_TRUE_VALUES = {"yes", "true", "y", "1"}
 _BOOL_FALSE_VALUES = {"no", "false", "n", "0"}
@@ -289,6 +240,8 @@ def extract_math_final_answer(text: str) -> str:
     return _normalize_math_answer(fallback)
 
 
+# ── DeepMath reward function ────────────────────────────────
+
 class DeepMathCorrectnessMarginReward(BaseRewardFunction):
     """DeepMath reward combining margin shaping and exact-match correctness."""
 
@@ -328,7 +281,9 @@ class DeepMathCorrectnessMarginReward(BaseRewardFunction):
         return texts
 
     def __call__(self, inputs: RewardInputs) -> torch.Tensor:
-        rewards = self.beta * (inputs.policy_scores.detach() - inputs.reference_scores.detach())
+        rewards = self.beta * (
+            inputs.policy_scores.detach() - inputs.reference_scores.detach()
+        )
 
         completion_texts = self._resolve_completion_texts(inputs)
         prompt_metadata = inputs.prompt_metadata
@@ -369,98 +324,3 @@ class DeepMathCorrectnessMarginReward(BaseRewardFunction):
             rewards = rewards - self.length_penalty * lengths
 
         return rewards
-
-
-class CallableReward(BaseRewardFunction):
-    """Reward function loaded from "module_path:function_name"."""
-
-    def __init__(self, callable_spec: str):
-        module_path, sep, function_name = callable_spec.partition(":")
-        if sep == "" or not module_path or not function_name:
-            raise ValueError(
-                "gspo_reward_callable must be in the form 'module_path:function_name'"
-            )
-
-        module = importlib.import_module(module_path)
-        reward_fn = getattr(module, function_name, None)
-        if reward_fn is None or not callable(reward_fn):
-            raise ValueError(f"Unable to load callable reward function: {callable_spec}")
-
-        self.reward_fn: Callable[[RewardInputs], torch.Tensor] = reward_fn
-
-    def __call__(self, inputs: RewardInputs) -> torch.Tensor:
-        rewards = self.reward_fn(inputs)
-        return _to_reward_tensor(rewards, inputs.policy_scores)
-
-
-class ClippedReward(BaseRewardFunction):
-    """Optional reward clipping wrapper."""
-
-    def __init__(
-        self,
-        base_reward_fn: BaseRewardFunction,
-        clip_min: Optional[float],
-        clip_max: Optional[float],
-    ):
-        self.base_reward_fn = base_reward_fn
-        self.clip_min = clip_min
-        self.clip_max = clip_max
-
-    def __call__(self, inputs: RewardInputs) -> torch.Tensor:
-        rewards = self.base_reward_fn(inputs)
-        min_v = self.clip_min if self.clip_min is not None else float("-inf")
-        max_v = self.clip_max if self.clip_max is not None else float("inf")
-        return rewards.clamp(min=min_v, max=max_v)
-
-
-def _to_reward_tensor(raw_rewards, template: torch.Tensor) -> torch.Tensor:
-    """Convert reward outputs into a tensor aligned to policy score shape/device."""
-    if isinstance(raw_rewards, torch.Tensor):
-        rewards = raw_rewards.to(device=template.device, dtype=template.dtype)
-    else:
-        rewards = torch.tensor(raw_rewards, device=template.device, dtype=template.dtype)
-
-    if rewards.shape != template.shape:
-        raise ValueError(
-            f"Reward shape {tuple(rewards.shape)} must match policy score shape {tuple(template.shape)}"
-        )
-
-    return rewards
-
-
-def build_reward_function(config) -> BaseRewardFunction:
-    """Build reward function according to GSPO config."""
-    source = config.gspo_reward_source
-
-    if source == "policy_ref_margin":
-        reward_fn: BaseRewardFunction = PolicyRefMarginReward(beta=config.gspo_reward_beta)
-    elif source == "length_penalized_margin":
-        reward_fn = LengthPenalizedMarginReward(
-            beta=config.gspo_reward_beta,
-            length_penalty=config.gspo_reward_length_penalty,
-        )
-    elif source == "deepmath_correctness_margin":
-        reward_fn = DeepMathCorrectnessMarginReward(
-            beta=config.gspo_reward_beta,
-            correct_bonus=config.gspo_deepmath_correct_bonus,
-            wrong_penalty=config.gspo_deepmath_wrong_penalty,
-            length_penalty=config.gspo_reward_length_penalty,
-            numeric_atol=config.gspo_deepmath_numeric_atol,
-            numeric_rtol=config.gspo_deepmath_numeric_rtol,
-            penalize_only_when_confident=config.gspo_deepmath_penalize_only_when_confident,
-        )
-    elif source == "callable":
-        if not config.gspo_reward_callable:
-            raise ValueError("gspo_reward_callable must be set when gspo_reward_source='callable'")
-        reward_fn = CallableReward(config.gspo_reward_callable)
-    else:
-        raise ValueError(f"Unknown gspo_reward_source: {source}")
-
-    if config.gspo_reward_clip_min is not None or config.gspo_reward_clip_max is not None:
-        reward_fn = ClippedReward(
-            base_reward_fn=reward_fn,
-            clip_min=config.gspo_reward_clip_min,
-            clip_max=config.gspo_reward_clip_max,
-        )
-
-    return reward_fn

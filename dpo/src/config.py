@@ -53,6 +53,9 @@ class WeDLMTrainingConfig:
     gspo_reward_clip_max: Optional[float] = None
     gspo_deepmath_correct_bonus: float = 1.0
     gspo_deepmath_wrong_penalty: float = 0.0
+    gspo_deepmath_numeric_atol: float = 1e-6
+    gspo_deepmath_numeric_rtol: float = 1e-5
+    gspo_deepmath_penalize_only_when_confident: bool = True
     
     # WeDLM specific
     block_size: int = 32
@@ -184,6 +187,12 @@ class WeDLMTrainingConfig:
 
         if self.gspo_deepmath_wrong_penalty < 0:
             raise ValueError("gspo_deepmath_wrong_penalty must be non-negative")
+
+        if self.gspo_deepmath_numeric_atol < 0:
+            raise ValueError("gspo_deepmath_numeric_atol must be non-negative")
+
+        if self.gspo_deepmath_numeric_rtol < 0:
+            raise ValueError("gspo_deepmath_numeric_rtol must be non-negative")
 
         if self.gspo_reward_source == "callable" and self.training_mode == "gspo":
             if not self.gspo_reward_callable:

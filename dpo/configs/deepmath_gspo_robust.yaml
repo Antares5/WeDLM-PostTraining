@@ -2,28 +2,19 @@
 model_path: "tencent/WeDLM-8B-Base"
 trust_remote_code: true
 
+# Mode
+training_mode: "gspo"
+
 # Data
-train_data: "data/alpaca_cleaned_sft.jsonl"
+train_data: "data/train.jsonl"
 max_seq_length: 2048
 
-# Mode
-training_mode: "dpo"  # "sft", "dpo" or "gspo"
-
-# DPO scaffold (increment 1/2)
-dpo_train_data: "data/pairwise_train.jsonl"
-dpo_beta: 0.1
-dpo_ref_model_path: null
-dpo_length_norm: true
-dpo_block_reduce: "mean"
-dpo_seq_reduce: "mean"
-dpo_num_mask_samples: 4
-
-# Online GSPO
-gspo_train_data: null
+# GSPO
+gspo_train_data: "data/train-deepmath-00000-of-00001.parquet"
 gspo_ref_model_path: null
 gspo_group_size: 4
 gspo_min_candidates_per_group: 2
-gspo_max_prompt_length: 1536
+gspo_max_prompt_length: 512
 gspo_max_new_tokens: 256
 gspo_rollout_temperature: 0.8
 gspo_rollout_top_p: 0.95
@@ -32,19 +23,26 @@ gspo_score_temperature: 1.0
 gspo_reward_temperature: 1.0
 gspo_ref_alpha: 1.0
 gspo_kl_coef: 0.0
-gspo_reward_beta: 0.1
-gspo_reward_source: "policy_ref_margin"  # policy_ref_margin | length_penalized_margin | deepmath_correctness_margin | callable
+
+# Reward shaping (conservative start)
+gspo_reward_beta: 0.2
+gspo_reward_source: "deepmath_correctness_margin"
 gspo_reward_length_penalty: 0.0
-gspo_reward_callable: null  # e.g. my_reward_module:compute_reward
+gspo_reward_callable: null
 gspo_reward_clip_min: null
 gspo_reward_clip_max: null
 gspo_deepmath_correct_bonus: 1.0
-gspo_deepmath_wrong_penalty: 0.0
+gspo_deepmath_wrong_penalty: 0.2
+# Numeric equivalence tolerances for answers like 0.5 vs 1/2
+gspo_deepmath_numeric_atol: 1.0e-6
+gspo_deepmath_numeric_rtol: 1.0e-5
+# Avoid penalizing ambiguous/unjudgeable extraction results
+gspo_deepmath_penalize_only_when_confident: true
 
 # WeDLM
 block_size: 32
 mask_per_block: true
-loss_weighting_scheme: "weighted" 
+loss_weighting_scheme: "weighted"
 mask_eps: 1.0e-8
 num_learnable_im_end: 0
 
@@ -52,11 +50,11 @@ num_learnable_im_end: 0
 enable_ar_loss: true
 ar_loss_weight: 1.0
 
-# Attention: "magi" or "dense"
+# Attention
 attention_backend: "dense"
 
 # Training
-output_dir: "outputs/wedlm-sft"
+output_dir: "outputs/wedlm-gspo-deepmath-robust"
 num_train_epochs: 1
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 1
@@ -83,13 +81,3 @@ save_total_limit: 3
 # Device & Seed
 bf16: true
 seed: 42
-
-# WandB (optional)
-# use_wandb: true
-# wandb_project: "wedlm-sft"
-# wandb_team: null
-# wandb_group: null
-# For private deployment:
-# wandb_host: ""
-# wandb_key: ""
-

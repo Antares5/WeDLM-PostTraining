@@ -97,6 +97,16 @@ def parse_args():
                         help="Correctness bonus for deepmath_correctness_margin reward")
     parser.add_argument("--gspo_deepmath_wrong_penalty", type=float, default=None,
                         help="Wrong-answer penalty for deepmath_correctness_margin reward")
+    parser.add_argument("--gspo_deepmath_numeric_atol", type=float, default=None,
+                        help="Absolute tolerance for numeric equivalence in deepmath reward")
+    parser.add_argument("--gspo_deepmath_numeric_rtol", type=float, default=None,
+                        help="Relative tolerance for numeric equivalence in deepmath reward")
+    parser.add_argument(
+        "--gspo_deepmath_penalize_only_when_confident",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Only apply wrong-penalty when answer matching is confidence-qualified",
+    )
     parser.add_argument("--rebuild_cache", action="store_true", help="Rebuild data cache")
     return parser.parse_args()
 
@@ -144,6 +154,9 @@ def main():
         "gspo_reward_clip_max",
         "gspo_deepmath_correct_bonus",
         "gspo_deepmath_wrong_penalty",
+        "gspo_deepmath_numeric_atol",
+        "gspo_deepmath_numeric_rtol",
+        "gspo_deepmath_penalize_only_when_confident",
     ]:
         if getattr(args, key, None) is not None:
             setattr(config, key, getattr(args, key))

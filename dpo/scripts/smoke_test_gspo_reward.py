@@ -5,7 +5,7 @@
 import torch
 
 from src import WeDLMTrainingConfig
-from src.reward import RewardInputs, build_reward_function
+from src.reward import RewardInputs, build_reward_function, extract_math_final_answer
 
 
 # Example custom reward for callable mode.
@@ -54,6 +54,19 @@ def _build_fake_inputs():
 def main():
     inputs = _build_fake_inputs()
 
+    # Extraction robustness checks for common DeepMath edge cases.
+    extraction_cases = [
+        (
+            "$\\begin{cases} 2x+3y-z=4 \\\\ x^2+y^2+z^2=9 \\end{cases}$",
+            "x^2+y^2+z^2=9",
+        ),
+        (
+            "$ \\begin{aligned} x(s) &= -3 - 49s, \\\\ y(s) &= -9 + 196s, \\\\ z(s) &= -40s. \\end{aligned} $",
+            "z(s)=-40s",
+        ),
+    ]
+    extraction_results = [extract_math_final_answer(raw) for raw, _ in extraction_cases]
+
     # Builtin: policy_ref_margin
     cfg = WeDLMTrainingConfig(training_mode="gspo")
     cfg.gspo_reward_source = "policy_ref_margin"
@@ -81,6 +94,7 @@ def main():
     reward_d = reward_fn(inputs)
 
     print("=== GSPO Reward Interface Smoke Test ===")
+    print(f"extraction_edge_cases: {extraction_results}")
     print(f"policy_ref_margin: {reward_a.tolist()}")
     print(f"length_penalized_margin: {reward_b.tolist()}")
     print(f"callable: {reward_c.tolist()}")

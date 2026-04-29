@@ -593,7 +593,11 @@ class WeDLMPairwiseDataset(Dataset):
 class WeDLMPromptDataset(Dataset):
     """Prompt-only dataset for online GSPO rollouts.
 
-    Supported JSONL formats per line:
+    Supported input formats:
+    - JSONL: one JSON item per line
+    - Parquet: one sample per row
+
+    Supported JSONL item formats per line:
     1) [{"role": ..., "content": ...}, ...]              # chat conversation
     2) {"messages": [...]}                                 # wrapped conversation
     3) {"prompt": ..., "chosen": ..., "rejected": ...}  # pairwise-style item
@@ -727,8 +731,11 @@ class WeDLMPromptDataset(Dataset):
             return None
         return torch.tensor(prompt_ids, dtype=torch.long)
 
-    def _load_and_tokenize_prompts(self, data_path: str) -> List[Dict[str, Any]]:
-        samples: List[Dict[str, Any]] = []
+    def _iter_data_items(self, data_path: str):
+        suffix = os.path.splitext(data_path)[1].lower()
+        if suffix == ".parquet":
+            yield from self._iter_parquet_items(data_path)
+            return
 
         with open(data_path, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f):
@@ -742,22 +749,58 @@ class WeDLMPromptDataset(Dataset):
                     logger.warning(f"Skipping line {line_num}: JSON decode error - {e}")
                     continue
 
-                prompt_messages = self._extract_prompt_messages(item)
-                if prompt_messages is None or len(prompt_messages) == 0:
-                    logger.warning(f"Skipping line {line_num}: unable to extract prompt messages")
-                    continue
+                yield line_num, item
 
-                prompt_ids = self._tokenize_prompt_messages(prompt_messages)
-                if prompt_ids is None:
-                    logger.warning(f"Skipping line {line_num}: empty prompt after tokenization")
-                    continue
+    def _iter_parquet_items(self, data_path: str):
+        row_idx = 0
 
-                samples.append(
-                    {
-                        "prompt_input_ids": prompt_ids,
-                        "prompt_metadata": self._extract_prompt_metadata(item),
-                    }
-                )
+        try:
+            import pyarrow.parquet as pq
+
+            parquet_file = pq.ParquetFile(data_path)
+            for batch in parquet_file.iter_batches():
+                for item in batch.to_pylist():
+                    yield row_idx, item
+                    row_idx += 1
+            return
+        except ImportError:
+            logger.warning(
+                "pyarrow is not installed. Falling back to pandas for parquet reading."
+            )
+
+        try:
+            import pandas as pd
+        except ImportError as e:
+            raise ImportError(
+                "Reading parquet data requires pyarrow or pandas. "
+                "Please install one of them, e.g. `pip install pyarrow`."
+            ) from e
+
+        dataframe = pd.read_parquet(data_path)
+        for item in dataframe.to_dict(orient="records"):
+            yield row_idx, item
+            row_idx += 1
+
+    def _load_and_tokenize_prompts(self, data_path: str) -> List[Dict[str, Any]]:
+        samples: List[Dict[str, Any]] = []
+
+        for item_idx, item in self._iter_data_items(data_path):
+            prompt_messages = self._extract_prompt_messages(item)
+            if prompt_messages is None or len(prompt_messages) == 0:
+                logger.warning(f"Skipping item {item_idx}: unable to extract prompt messages")
+                continue
+
+            prompt_ids = self._tokenize_prompt_messages(prompt_messages)
+            if prompt_ids is None:
+                logger.warning(f"Skipping item {item_idx}: empty prompt after tokenization")
+                continue
+
+            samples.append(
+                {
+                    "prompt_input_ids": prompt_ids,
+                    "prompt_metadata": self._extract_prompt_metadata(item),
+                }
+            )
 
         return samples
 
