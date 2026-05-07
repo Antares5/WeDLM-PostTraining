@@ -94,7 +94,7 @@ class WeDLMTrainingConfig:
     wandb_key: Optional[str] = None   # API key
     
     def __post_init__(self):
-        if self.training_mode not in ["sft", "dpo"]:
+        if self.training_mode not in ["sft", "dpo", "gspo"]:
             raise ValueError(f"Unknown training_mode: {self.training_mode}")
 
         if self.loss_weighting_scheme not in ["uniform", "weighted"]:
