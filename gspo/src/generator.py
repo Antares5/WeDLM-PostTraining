@@ -306,6 +306,10 @@ def _prune_window_prefix(
     Scans window_mask_flags from the start.  Every token before the first
     remaining mask is considered "confirmed" and is moved to committed_ids.
 
+    Respects ``params.max_tokens``: if committing the full prefix would
+    exceed the budget, only commits up to the budget and marks the sequence
+    as finished.
+
     Returns the list of newly committed token ids (from the window prefix).
     """
     window = state.window_tokens
@@ -313,10 +317,20 @@ def _prune_window_prefix(
 
     # Find first index that is still masked.
     mask_positions = [i for i, f in enumerate(flags) if f]
-    prune_count = mask_positions[0] if mask_positions else len(window)
+    full_prune_count = mask_positions[0] if mask_positions else len(window)
 
-    if prune_count == 0:
+    if full_prune_count == 0:
         return []
+
+    # Clamp to max_tokens budget.
+    remaining_budget = params.max_tokens - len(state.generated_ids)
+    if remaining_budget <= 0:
+        state.is_finished = True
+        state.window_tokens = []
+        state.window_mask_flags = []
+        return []
+
+    prune_count = min(full_prune_count, remaining_budget)
 
     pruned = window[:prune_count]
     newly_generated: List[int] = []
@@ -324,18 +338,21 @@ def _prune_window_prefix(
     for tok in pruned:
         state.committed_ids.append(tok)
         state.generated_ids.append(tok)
-
         newly_generated.append(tok)
 
         if tok == eos_token_id:
             state.is_finished = True
             break
 
+    # If budget was exhausted (truncation), mark finished.
+    if len(state.generated_ids) >= params.max_tokens:
+        state.is_finished = True
+
     if state.is_finished:
         state.window_tokens = []
         state.window_mask_flags = []
     else:
-        # Shift window: remove prefix, append new mask tokens.
+        # Shift window: remove pruned tokens, refill with new masks.
         refill_count = prune_count
         state.window_tokens = (
             window[prune_count:] + [params.mask_token_id] * refill_count
