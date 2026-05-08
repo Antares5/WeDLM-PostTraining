@@ -72,3 +72,4 @@ dmypy.json
 .ruff_cache
 
 data/
+gspo/train-deepmath-00000-of-00001.parquet

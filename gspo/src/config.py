@@ -67,5 +67,5 @@ class GSPOConfig(WeDLMTrainingConfig):
             raise ValueError("gspo_num_mask_samples must be >= 1")
         if self.gspo_kl_estimator not in ("k3", "reverse_kl", "none"):
             raise ValueError(f"Unknown kl_estimator: {self.gspo_kl_estimator}")
-        if self.gspo_reward_type not in ("math_verify", "string_match"):
+        if self.gspo_reward_type not in ("math_verify", "deepmath", "string_match"):
             raise ValueError(f"Unknown reward_type: {self.gspo_reward_type}")

@@ -9,7 +9,7 @@ model_path: "tencent/WeDLM-8B-Instruct"
 trust_remote_code: true
 
 # ── Data ────────────────────────────────────────────────────────────
-train_data: "data/gspo_prompts.jsonl"
+train_data: "data/train-deepmath-00000-of-00001.parquet"
 max_seq_length: 2048
 
 # ── Mode ────────────────────────────────────────────────────────────
@@ -35,7 +35,7 @@ gspo_gen_window_size: 16
 gspo_gen_pos_penalty_factor: 0.02
 
 # ── Reward ──────────────────────────────────────────────────────────
-gspo_reward_type: "math_verify"    # "math_verify" | "string_match"
+gspo_reward_type: "deepmath"         # "deepmath" | "math_verify" | "string_match"
 
 # ── WeDLM ───────────────────────────────────────────────────────────
 block_size: 32

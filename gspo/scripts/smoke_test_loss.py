@@ -250,6 +250,52 @@ def test_compute_rewards_batch():
     logger.info("  PASSED\n")
 
 
+def test_deepmath_reward():
+    """Verify DeepMath reward extraction and matching."""
+    logger.info("=== test_deepmath_reward ===")
+
+    from loss import deepmath_reward, _extract_deepmath_answer
+
+    # Answer extraction.
+    assert _extract_deepmath_answer("Therefore, the answer is Yes.") == "Yes"
+    assert _extract_deepmath_answer("Thus, 42\nis the answer.") == "42"
+    assert _extract_deepmath_answer("#### 3.14") == "3.14"
+    assert _extract_deepmath_answer(r"\boxed{No}") == "No"
+    assert _extract_deepmath_answer("Answer: True") == "True"
+    assert _extract_deepmath_answer("So, the set has 5 elements.") == "5"
+    logger.info("  ✓ answer extraction from various formats")
+
+    # Yes/No matching.
+    assert deepmath_reward("The answer is Yes.", "yes") == 1.0
+    assert deepmath_reward("Therefore, No.", "no") == 1.0
+    assert deepmath_reward("Answer: true", "yes") == 1.0   # yes variants
+    assert deepmath_reward("Answer: false", "no") == 1.0   # no variants
+    assert deepmath_reward("Answer: No.", "yes") == 0.0    # mismatch
+    logger.info("  ✓ yes/no case-insensitive matching")
+
+    # Numeric matching.
+    assert deepmath_reward("The answer is 42.", "42") == 1.0
+    assert deepmath_reward("Thus, 3.14.", "3.14") == 1.0
+    assert deepmath_reward("#### 1,000", "1000") == 1.0
+    assert deepmath_reward("Result: 0.333", "0.333") == 1.0
+    logger.info("  ✓ numeric matching")
+
+    # No answer → 0.
+    assert deepmath_reward("I don't know.", "yes") == 0.0
+    logger.info("  ✓ no extractable answer → 0.0")
+
+    # Batch compute_rewards with deepmath type.
+    r = compute_rewards(
+        ["Answer: Yes", "So, the result is 5.", "I don't know"],
+        ["yes", "5", "no"],
+        reward_type="deepmath",
+    )
+    assert r.tolist() == [1.0, 1.0, 0.0], f"got {r.tolist()}"
+    logger.info("  ✓ batch deepmath rewards: %s", r.tolist())
+
+    logger.info("  PASSED\n")
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -268,6 +314,7 @@ def main():
     test_grpo_loss_clipping()
     test_math_reward()
     test_compute_rewards_batch()
+    test_deepmath_reward()
 
     logger.info("=" * 60)
     logger.info("All tests passed!")

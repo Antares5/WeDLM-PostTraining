@@ -277,6 +277,99 @@ def math_reward(
     return 1.0 if pred_clean == gt_clean else 0.0
 
 
+def deepmath_reward(
+    completion_text: str,
+    ground_truth: str,
+    tolerance: float = 1e-3,
+) -> float:
+    """Reward function for DeepMath-style completions.
+
+    DeepMath questions have diverse answer types:
+    - Yes/No binary questions
+    - Numeric computation results
+    - Short text answers
+
+    This function:
+    1. Extracts the **final answer** from the completion (looking for
+       answer markers like "Answer:", "Therefore", etc.)
+    2. Compares case-insensitively for yes/no, numerically for numbers.
+    """
+    # ── 1. Extract final answer from completion ──────────────────
+    pred = _extract_deepmath_answer(completion_text)
+    if pred is None:
+        return 0.0
+
+    # ── 2. Clean & compare ──────────────────────────────────────
+    pred_clean = pred.strip().lower()
+    gt_clean = ground_truth.strip().lower()
+
+    # Exact match after cleaning.
+    if pred_clean == gt_clean:
+        return 1.0
+
+    # Yes/No variants.
+    yes_variants = {"yes", "y", "true", "t", "1"}
+    no_variants = {"no", "n", "false", "f", "0"}
+    if gt_clean in yes_variants and pred_clean in yes_variants:
+        return 1.0
+    if gt_clean in no_variants and pred_clean in no_variants:
+        return 1.0
+
+    # Numeric comparison (with comma removal, unit stripping).
+    pred_num = normalize_number(pred_clean.replace(",", ""))
+    gt_num = normalize_number(gt_clean.replace(",", ""))
+    if pred_num is not None and gt_num is not None:
+        if abs(gt_num) < 1e-12:
+            return 1.0 if abs(pred_num) < tolerance else 0.0
+        rel_err = abs(pred_num - gt_num) / (abs(gt_num) + 1e-8)
+        return 1.0 if rel_err < tolerance else 0.0
+
+    return 0.0
+
+
+def _extract_deepmath_answer(text: str) -> Optional[str]:
+    """Extract the final answer from a DeepMath-style completion.
+
+    Tries, in order:
+    1. ``#### <answer>`` marker
+    2. ``\\boxed{<answer>}``
+    3. ``Answer: <answer>`` or ``answer: <answer>``
+    4. ``Therefore, <answer>`` / ``Thus, <answer>`` / ``So, <answer>``
+    5. Last non-empty line of the text
+    """
+    # 1. #### marker (GSM8K style).
+    m = re.findall(r"####\s*(.+)", text)
+    if m:
+        return m[-1].strip()
+
+    # 2. \boxed{...}
+    m = re.findall(r"\\boxed\{([^}]+)\}", text)
+    if m:
+        return m[-1].strip()
+
+    # 3. Answer: / answer:
+    m = re.findall(r"(?i)answer\s*:\s*(.+?)(?:\.|$)", text)
+    if m:
+        return m[-1].strip()
+
+    # 4. Therefore / Thus / So / Hence ...
+    for prefix in ["Therefore,", "Thus,", "So,", "Hence,", "The answer is"]:
+        m = re.findall(rf"{prefix}\s*(.+?)(?:\.|$)", text, re.IGNORECASE)
+        if m:
+            return m[-1].strip()
+
+    # 5. Last non-empty line.
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    if lines:
+        # Skip LaTeX structural lines.
+        latex_struct = {r"\begin{cases}", r"\end{cases}", r"\begin{array}", r"\end{array}", r"\\"}
+        last = lines[-1]
+        if last not in latex_struct:
+            return last
+
+    return None
+
+
 def compute_rewards(
     completion_texts: List[str],
     ground_truths: List[str],
@@ -287,7 +380,7 @@ def compute_rewards(
     Args:
         completion_texts: List of decoded completion strings.
         ground_truths: List of ground-truth answer strings (same length).
-        reward_type: ``"math_verify"`` (default), or ``"string_match"``.
+        reward_type: ``"math_verify"``, ``"deepmath"``, or ``"string_match"``.
 
     Returns:
         rewards: Float tensor [B].
@@ -296,6 +389,8 @@ def compute_rewards(
     for comp, gt in zip(completion_texts, ground_truths):
         if reward_type == "math_verify":
             r = math_reward(comp, gt)
+        elif reward_type == "deepmath":
+            r = deepmath_reward(comp, gt)
         elif reward_type == "string_match":
             r = 1.0 if comp.strip() == gt.strip() else 0.0
         else:
