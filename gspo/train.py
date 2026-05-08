@@ -35,16 +35,36 @@ logger = logging.getLogger(__name__)
 def parse_args():
     parser = argparse.ArgumentParser(description="GSPO Training for WeDLM")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
-    # Overrides.
+
+    # ── Model / Data / Output ───────────────────────────────────────
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--train_data", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--attention_backend", type=str, choices=["magi", "dense"], default=None)
+
+    # ── GRPO core ───────────────────────────────────────────────────
     parser.add_argument("--gspo_group_size", type=int, default=None)
     parser.add_argument("--gspo_clip_epsilon", type=float, default=None)
     parser.add_argument("--gspo_old_model_update_steps", type=int, default=None)
     parser.add_argument("--gspo_kl_beta", type=float, default=None)
-    parser.add_argument("--gspo_reward_type", type=str, choices=["math_verify", "string_match"], default=None)
+    parser.add_argument("--gspo_kl_estimator", type=str, choices=["k3", "reverse_kl", "none"], default=None)
+    parser.add_argument("--gspo_reward_type", type=str, choices=["math_verify", "deepmath", "string_match"], default=None)
+
+    # ── Scoring / Generation ────────────────────────────────────────
+    parser.add_argument("--gspo_num_mask_samples", type=int, default=None)
+    parser.add_argument("--gspo_gen_max_tokens", type=int, default=None)
+    parser.add_argument("--gspo_gen_temperature", type=float, default=None)
+
+    # ── Training hyper-params ───────────────────────────────────────
+    parser.add_argument("--per_device_train_batch_size", type=int, default=None)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=None)
+    parser.add_argument("--num_train_epochs", type=int, default=None)
+    parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--max_seq_length", type=int, default=None)
+    parser.add_argument("--logging_steps", type=int, default=None)
+    parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+
     return parser.parse_args()
 
 
@@ -56,7 +76,11 @@ def main():
     overrides = [
         "model_path", "train_data", "output_dir", "attention_backend",
         "gspo_group_size", "gspo_clip_epsilon", "gspo_old_model_update_steps",
-        "gspo_kl_beta", "gspo_reward_type",
+        "gspo_kl_beta", "gspo_kl_estimator", "gspo_reward_type",
+        "gspo_num_mask_samples", "gspo_gen_max_tokens", "gspo_gen_temperature",
+        "per_device_train_batch_size", "gradient_accumulation_steps",
+        "num_train_epochs", "learning_rate", "max_seq_length",
+        "logging_steps", "save_steps", "seed",
     ]
     for key in overrides:
         val = getattr(args, key, None)
