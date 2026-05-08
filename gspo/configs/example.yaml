@@ -1,0 +1,87 @@
+# GSPO (Group-level Sequence-level Preference Optimization) — Example Config
+# ============================================================================
+# Usage:
+#   accelerate launch --multi_gpu --num_processes 4 --mixed_precision bf16 \
+#       train.py --config configs/example.yaml
+
+# ── Model ───────────────────────────────────────────────────────────
+model_path: "tencent/WeDLM-8B-Instruct"
+trust_remote_code: true
+
+# ── Data ────────────────────────────────────────────────────────────
+train_data: "data/gspo_prompts.jsonl"
+max_seq_length: 2048
+
+# ── Mode ────────────────────────────────────────────────────────────
+training_mode: "gspo"
+
+# ── GRPO Core ───────────────────────────────────────────────────────
+gspo_group_size: 4                 # G: completions per prompt
+gspo_clip_epsilon: 0.2             # ε: PPO clip range
+gspo_old_model_update_steps: 25    # sync old_policy every K steps
+
+# ── KL Regularisation ───────────────────────────────────────────────
+gspo_kl_beta: 0.01                 # β_KL (0 = no KL penalty)
+gspo_kl_estimator: "k3"            # "k3" | "reverse_kl" | "none"
+
+# ── Scoring ─────────────────────────────────────────────────────────
+gspo_num_mask_samples: 2           # K: mask MC samples for score averaging
+
+# ── Generation ──────────────────────────────────────────────────────
+gspo_gen_max_tokens: 256
+gspo_gen_temperature: 1.0
+gspo_gen_window_size: 16
+# gspo_gen_entropy_threshold: null  # null = single-position fill per step
+gspo_gen_pos_penalty_factor: 0.02
+
+# ── Reward ──────────────────────────────────────────────────────────
+gspo_reward_type: "math_verify"    # "math_verify" | "string_match"
+
+# ── WeDLM ───────────────────────────────────────────────────────────
+block_size: 32
+mask_per_block: true
+loss_weighting_scheme: "weighted"
+mask_eps: 1.0e-8
+num_learnable_im_end: 0
+
+# ── AR anchor (not used by GSPO) ────────────────────────────────────
+enable_ar_loss: false
+ar_loss_weight: 1.0
+
+# ── Attention ───────────────────────────────────────────────────────
+attention_backend: "dense"          # "magi" or "dense"
+
+# ── Training ────────────────────────────────────────────────────────
+output_dir: "outputs/gspo-run"
+num_train_epochs: 1
+per_device_train_batch_size: 1      # B: prompts per step
+gradient_accumulation_steps: 4      # effective batch = B * GA
+learning_rate: 1.0e-6
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.1
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+# ── Cache ───────────────────────────────────────────────────────────
+rebuild_cache: false
+
+# ── DeepSpeed ───────────────────────────────────────────────────────
+use_deepspeed: false
+deepspeed_zero_stage: 2
+deepspeed_offload_optimizer: false
+deepspeed_offload_param: false
+
+# ── Logging ─────────────────────────────────────────────────────────
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+
+# ── Device ──────────────────────────────────────────────────────────
+bf16: true
+seed: 42
+
+# ── WandB (optional) ────────────────────────────────────────────────
+# use_wandb: true
+# wandb_project: "wedlm-gspo"
+# wandb_team: null
+# wandb_group: null
