@@ -330,14 +330,13 @@ def deepmath_reward(
 def _extract_deepmath_answer(text: str) -> Optional[str]:
     """Extract the final answer from a DeepMath-style completion.
 
-    Tries, in order:
-    1. ``#### <answer>`` marker
-    2. ``\\boxed{<answer>}``
-    3. ``Answer: <answer>`` or ``answer: <answer>``
-    4. ``Therefore, <answer>`` / ``Thus, <answer>`` / ``So, <answer>``
-    5. Last non-empty line of the text
+    Strategy (ordered by priority):
+    1. Explicit markers: ``####``, ``\\boxed{}``, ``Answer:``
+    2. "the answer is/must be/would be X"
+    3. Last standalone Yes/No or number in the text (fallback)
+    4. Last non-empty line (final fallback)
     """
-    # 1. #### marker (GSM8K style).
+    # 1. #### marker.
     m = re.findall(r"####\s*(.+)", text)
     if m:
         return m[-1].strip()
@@ -347,25 +346,34 @@ def _extract_deepmath_answer(text: str) -> Optional[str]:
     if m:
         return m[-1].strip()
 
-    # 3. Answer: / answer:
+    # 3. Answer: / answer: (with colon).
     m = re.findall(r"(?i)answer\s*:\s*(.+?)(?:\.|$)", text)
     if m:
         return m[-1].strip()
 
-    # 4. Therefore / Thus / So / Hence ...
-    for prefix in ["Therefore,", "Thus,", "So,", "Hence,", "The answer is"]:
-        m = re.findall(rf"{prefix}\s*(.+?)(?:\.|$)", text, re.IGNORECASE)
-        if m:
-            return m[-1].strip()
+    # 4. "the answer is/must be/would be/should be X"
+    m = re.findall(
+        r"(?i)the\s+answer\s+(?:is|must\s+be|would\s+be|should\s+be)\s+"
+        r"([\w\-]+(?:\.\d+)?)",
+        text,
+    )
+    if m:
+        return m[-1].strip()
 
-    # 5. Last non-empty line.
+    # 5. Fallback: last standalone Yes/No/true/false or number.
+    yn = re.findall(r"\b(yes|no|true|false)\b", text, re.IGNORECASE)
+    nums = re.findall(r"-?[\d,]+(?:\.\d+)?", text)
+    if yn:
+        return yn[-1].strip()
+    if nums:
+        return nums[-1].strip()
+
+    # 6. Last non-empty line (skip LaTeX structural lines).
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    if lines:
-        # Skip LaTeX structural lines.
-        latex_struct = {r"\begin{cases}", r"\end{cases}", r"\begin{array}", r"\end{array}", r"\\"}
-        last = lines[-1]
-        if last not in latex_struct:
-            return last
+    latex_struct = {r"\begin{cases}", r"\end{cases}", r"\begin{array}", r"\end{array}", r"\\"}
+    for line in reversed(lines):
+        if line not in latex_struct and len(line) < 200:
+            return line
 
     return None
 
