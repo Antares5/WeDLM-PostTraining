@@ -87,11 +87,13 @@ def test_k3_kl():
     assert kl_pos.item() >= -1e-5, f"k3 KL should be non-negative in expectation"
     logger.info("  ✓ KL is non-negative: %e", kl_pos.item())
 
-    # Gradient flows through s_policy.
-    kl_grad = compute_k3_kl(s_policy, s_ref)
+    # Gradient flows through s_policy (use different scores so grad ≠ 0).
+    s_policy_g = torch.tensor([0.0, -1.0, -2.0, -3.0], requires_grad=True)
+    s_ref_g = torch.tensor([-0.5, -1.5, -2.5, -3.5])
+    kl_grad = compute_k3_kl(s_policy_g, s_ref_g)
     kl_grad.backward()
-    assert s_policy.grad is not None, "no grad on s_policy"
-    assert (s_policy.grad.abs().sum() > 0), "gradient is all zero"
+    assert s_policy_g.grad is not None, "no grad on s_policy"
+    assert (s_policy_g.grad.abs().sum() > 0), "gradient is all zero"
     logger.info("  ✓ gradient flows through k3 KL")
 
     logger.info("  PASSED\n")
