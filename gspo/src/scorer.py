@@ -270,13 +270,29 @@ def compute_gspo_scores(
     logger.debug("Scorer: %d sequences, %d tokens packed", bs, packed_ids.size(0))
 
     # ── 2. Accumulators ───────────────────────────────────────────────
-    s_policy_acc: List[torch.Tensor] = []
+    #    Store per-sample scalar scores (B*G values each), NOT full logits.
+    s_policy_acc: List[torch.Tensor] = []   # list of K tensors [bs]
     s_old_acc: List[torch.Tensor] = []
     s_ref_acc: List[torch.Tensor] = []
 
+    # ── Helper: compute scores in one shot, return [bs] tensor ───────
+    def _score_one(logits_tensor: torch.Tensor, b: WeDLMBatch) -> torch.Tensor:
+        scores, _logs = compute_block_scores(
+            logits=logits_tensor,
+            targets=b.original_ids,
+            masked_indices=b.masked_indices,
+            p_mask=b.p_mask,
+            logical_positions=b.logical_positions,
+            cum_seqlens=b.cum_seqlens,
+            block_size=scorer_config.block_size,
+            weighting_scheme=scorer_config.loss_weighting_scheme,
+            block_reduce=scorer_config.block_reduce,
+            seq_reduce=scorer_config.seq_reduce,
+            eps=scorer_config.mask_eps,
+        )
+        return scores  # [bs]
+
     for k in range(K):
-        # Build a fresh random-mask batch (same underlying sequences,
-        # different mask patterns).
         batch = build_wedlm_batch(
             packed_input_ids=packed_ids,
             packed_labels=packed_labels,
@@ -288,65 +304,28 @@ def compute_gspo_scores(
             eps=scorer_config.mask_eps,
         )
 
-        # ── 2a. Reference model (no grad) ─────────────────────────
+        # ── Reference model (no grad) ───────────────────────────
         if ref_model is not None:
             with torch.no_grad():
                 ref_logits = _single_model_forward(ref_model, batch, attn_wrapper, backend)
-                s_ref_k, _ = compute_block_scores(
-                    logits=ref_logits,
-                    targets=batch.original_ids,
-                    masked_indices=batch.masked_indices,
-                    p_mask=batch.p_mask,
-                    logical_positions=batch.logical_positions,
-                    cum_seqlens=batch.cum_seqlens,
-                    block_size=scorer_config.block_size,
-                    weighting_scheme=scorer_config.loss_weighting_scheme,
-                    block_reduce=scorer_config.block_reduce,
-                    seq_reduce=scorer_config.seq_reduce,
-                    eps=scorer_config.mask_eps,
-                )
+                s_ref_k = _score_one(ref_logits, batch)
             s_ref_acc.append(s_ref_k.detach())
             del ref_logits
 
-        # ── 2b. Old-policy model (no grad) ────────────────────────
+        # ── Old-policy model (no grad) ──────────────────────────
         with torch.no_grad():
             old_logits = _single_model_forward(old_model, batch, attn_wrapper, backend)
-            s_old_k, _ = compute_block_scores(
-                logits=old_logits,
-                targets=batch.original_ids,
-                masked_indices=batch.masked_indices,
-                p_mask=batch.p_mask,
-                logical_positions=batch.logical_positions,
-                cum_seqlens=batch.cum_seqlens,
-                block_size=scorer_config.block_size,
-                weighting_scheme=scorer_config.loss_weighting_scheme,
-                block_reduce=scorer_config.block_reduce,
-                seq_reduce=scorer_config.seq_reduce,
-                eps=scorer_config.mask_eps,
-            )
+            s_old_k = _score_one(old_logits, batch)
         s_old_acc.append(s_old_k.detach())
         del old_logits
 
-        # ── 2c. Policy model (WITH grad) ─────────────────────────
+        # ── Policy model (WITH grad) ────────────────────────────
+        #    Compute scores immediately and free the large logits tensor
+        #    to avoid accumulating intermediate activations across K samples.
         policy_logits = _single_model_forward(policy_model, batch, attn_wrapper, backend)
-        s_policy_k, _ = compute_block_scores(
-            logits=policy_logits,
-            targets=batch.original_ids,
-            masked_indices=batch.masked_indices,
-            p_mask=batch.p_mask,
-            logical_positions=batch.logical_positions,
-            cum_seqlens=batch.cum_seqlens,
-            block_size=scorer_config.block_size,
-            weighting_scheme=scorer_config.loss_weighting_scheme,
-            block_reduce=scorer_config.block_reduce,
-            seq_reduce=scorer_config.seq_reduce,
-            eps=scorer_config.mask_eps,
-        )
-        s_policy_acc.append(s_policy_k)  # keep grad
-        del policy_logits
-
-        # Free batch tensors (safeguard)
-        del batch
+        s_policy_k = _score_one(policy_logits, batch)   # [bs], differentiable
+        s_policy_acc.append(s_policy_k)                  # keep grad
+        del policy_logits, batch
 
     # ── 3. Average across mask samples ─────────────────────────────────
     s_policy = torch.stack(s_policy_acc, dim=0).mean(dim=0)   # [bs] with grad
