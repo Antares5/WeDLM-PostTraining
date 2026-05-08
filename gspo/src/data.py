@@ -108,25 +108,91 @@ class GSPOPromptDataset(Dataset):
                     "Install with: pip install pyarrow"
                 )
 
-        samples: List[Dict[str, Any]] = []
-        for _, row in df.iterrows():
-            item = row.to_dict()
-            # Parquet may store lists as numpy arrays; convert.
-            prompt = item.get("prompt")
-            if isinstance(prompt, (list,)) and not isinstance(prompt, str):
-                # Could be [{'role':'user','content':'...'}].
-                item["prompt"] = list(prompt) if hasattr(prompt, '__iter__') else prompt
-            # Normalise column names.
-            if "solution" in item and "ground_truth" not in item:
-                item["ground_truth"] = item["solution"]
-            if "answer" in item and "ground_truth" not in item:
-                item["ground_truth"] = item["answer"]
+        # Determine column names.
+        cols = list(df.columns)
+        prompt_col = next((c for c in cols if c.lower() in ("prompt", "question", "instruction", "messages")), None)
+        truth_col = next((c for c in cols if c.lower() in ("solution", "answer", "ground_truth", "target")), None)
 
-            prompt_text, ground_truth = self._extract(item)
-            if prompt_text is None or ground_truth is None:
+        if prompt_col is None:
+            raise ValueError(f"Could not find prompt column in parquet. Columns: {cols}")
+        if truth_col is None:
+            raise ValueError(f"Could not find ground-truth column in parquet. Columns: {cols}")
+
+        logger.info("Parquet columns: prompt='%s', ground_truth='%s'", prompt_col, truth_col)
+
+        samples: List[Dict[str, Any]] = []
+        for idx, row in df.iterrows():
+            # Extract raw values.
+            raw_prompt = row[prompt_col]
+            raw_truth = row[truth_col]
+
+            # Normalise prompt to plain list-of-dicts.
+            msgs = self._normalise_messages(raw_prompt)
+            if msgs is None:
+                logger.warning("Row %d: could not parse prompt, skipped", idx)
                 continue
+
+            # Build prompt text via chat template.
+            try:
+                prompt_text = self.tokenizer.apply_chat_template(
+                    msgs, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception:
+                # Fallback: concat user content.
+                parts = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+                prompt_text = "\n".join(parts) if parts else None
+
+            if not prompt_text:
+                continue
+
+            # Normalise ground truth.
+            ground_truth = self._normalize(raw_truth)
+            if ground_truth is None:
+                continue
+
             samples.append({"prompt": prompt_text, "ground_truth": str(ground_truth)})
         return samples
+
+    @staticmethod
+    def _normalise_messages(value: Any) -> Optional[List[Dict[str, str]]]:
+        """Convert a prompt value into a clean list of role/content dicts.
+
+        Handles:
+        - Plain string
+        - list of dicts (may be wrapped in numpy array)
+        - single dict
+        """
+        if value is None:
+            return None
+
+        # Plain string → wrap as single user message.
+        if isinstance(value, str):
+            s = value.strip()
+            return [{"role": "user", "content": s}] if s else None
+
+        # numpy array → convert to list recursively.
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+
+        # Single dict → wrap in list.
+        if isinstance(value, dict):
+            if "role" in value and "content" in value:
+                return [{"role": str(value["role"]), "content": str(value["content"])}]
+            return None
+
+        # List of dicts (expected case).
+        if isinstance(value, list):
+            clean: List[Dict[str, str]] = []
+            for item in value:
+                if isinstance(item, dict):
+                    role = str(item.get("role", "user"))
+                    content = str(item.get("content", ""))
+                    clean.append({"role": role, "content": content})
+                elif isinstance(item, str):
+                    clean.append({"role": "user", "content": item})
+            return clean if clean else None
+
+        return None
 
     def _normalize(self, value) -> Optional[str]:
         if isinstance(value, str):
@@ -135,51 +201,32 @@ class GSPOPromptDataset(Dataset):
         return None
 
     def _extract(self, item: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
-        """Extract (prompt_text, ground_truth) from a dict item."""
-        # Prompt: try several common field names.
+        """Extract (prompt_text, ground_truth) from a JSONL dict item.
+
+        For parquet data, this is not used—see ``_load_parquet`` and
+        ``_normalise_messages`` instead.
+        """
+        # Prompt: try string fields, then messages list.
         prompt = (
             self._normalize(item.get("prompt"))
             or self._normalize(item.get("question"))
             or self._normalize(item.get("instruction"))
         )
-        # If prompt is a list (messages format), convert to text.
-        if prompt is None and "prompt" in item and isinstance(item["prompt"], list):
-            msgs = item["prompt"]
-            # Handle numpy-array-wrapped dicts from parquet.
-            if hasattr(msgs, 'tolist'):
-                msgs = msgs.tolist()
-            if isinstance(msgs, list) and len(msgs) > 0:
-                # Ensure each element is a plain dict.
-                clean_msgs = []
-                for m in msgs:
-                    if isinstance(m, dict):
-                        clean_msgs.append({"role": m.get("role", "user"),
-                                           "content": m.get("content", "")})
-                if clean_msgs:
-                    try:
-                        prompt = self.tokenizer.apply_chat_template(
-                            clean_msgs, tokenize=False, add_generation_prompt=True,
-                        )
-                    except Exception:
-                        parts = [m["content"] for m in clean_msgs if m.get("role") == "user"]
-                        prompt = "\n".join(parts) if parts else None
-
-        # Also try messages field.
         if prompt is None and "messages" in item:
-            msgs = item["messages"]
-            if isinstance(msgs, list):
+            msgs = self._normalise_messages(item["messages"])
+            if msgs:
                 try:
                     prompt = self.tokenizer.apply_chat_template(
                         msgs, tokenize=False, add_generation_prompt=True,
                     )
                 except Exception:
-                    parts = [m.get("content", "") for m in msgs if m.get("role") == "user"]
+                    parts = [m["content"] for m in msgs if m.get("role") == "user"]
                     prompt = "\n".join(parts) if parts else None
 
-        if prompt is None:
+        if not prompt:
             return None, None
 
-        # Ground truth: try several field names.
+        # Ground truth.
         truth = (
             self._normalize(item.get("ground_truth"))
             or self._normalize(item.get("answer"))
