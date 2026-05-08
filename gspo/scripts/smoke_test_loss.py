@@ -107,7 +107,7 @@ def test_grpo_loss_basic():
     BxG = B * G
 
     # Scenario: scores slightly higher for better rewards.
-    s_policy = torch.randn(BxG, requires_grad=True) * 0.1
+    s_policy = (torch.randn(BxG) * 0.1).requires_grad_(True)
     s_old = s_policy.detach().clone() + torch.randn(BxG) * 0.05
     rewards = torch.cat([
         torch.tensor([0.0, 0.0, 1.0, 1.0]),    # group 0
