@@ -240,9 +240,9 @@ class GSPOTrainer:
     def _make_system_prompt() -> str:
         return (
             "You are a math problem solver. "
-            "For each question, think step by step carefully and explain your reasoning in detail. "
-            "Show all your work and calculations. "
-            "After your reasoning, you MUST end with a single line giving the final answer "
+            "For each question, think step by step carefully and explain your reasoning. "
+            "Show your work and calculations. "
+            "At the end, you MUST write the final answer on its own line "
             "in exactly this format: Answer: <your answer>"
         )
 

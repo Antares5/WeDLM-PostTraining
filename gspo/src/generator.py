@@ -479,15 +479,34 @@ def wedlm_generate(
             params.pos_penalty_factor,
         )
 
-        # 3f. Fill selected positions in the window.
+        # 3f. Fill selected positions in the window, check EOS instantly.
+        hit_eos = False
+        eos_window_pos = -1
         for sel in fill_sel:
             win_pos = int(window_local_idx[sel].item())
             tok = int(sampled[sel].item())
             if 0 <= win_pos < len(state.window_tokens):
                 state.window_tokens[win_pos] = tok
                 state.window_mask_flags[win_pos] = False
+                if tok == eos_token_id:
+                    hit_eos = True
+                    eos_window_pos = win_pos
 
-        # 3g. Prune confirmed prefix & check stop conditions.
+        # 3g. If EOS was filled: commit all completion tokens before EOS,
+        #     plus EOS itself, then stop.
+        if hit_eos:
+            for j in range(eos_window_pos + 1):
+                tok = state.window_tokens[j]
+                if not state.window_mask_flags[j]:
+                    # This is a filled (non-mask) token; commit it.
+                    state.committed_ids.append(tok)
+                    state.generated_ids.append(tok)
+            state.window_tokens = []
+            state.window_mask_flags = []
+            state.is_finished = True
+            break
+
+        # 3h. Prune confirmed prefix & check stop conditions.
         _prune_window_prefix(state, params, eos_token_id)
 
         # Guard: if window became empty, stop.
