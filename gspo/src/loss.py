@@ -499,9 +499,10 @@ def compute_rewards(
             # Also check if ground truth matches any extraction method.
             gt_clean = gt_stripped.strip().lower()
             for method_name, pred_val in [("deepmath", pred_deepmath), ("boxed", pred_boxed), ("math", pred_math)]:
-                if pred_val and pred_val.strip().lower() == gt_clean:
+                if pred_val and pred_val.strip().lower() == gt_clean and r == 0.0:
                     logger.warning(
-                        "Reward[%d]: gt MATCHES %s extractor but reward=%.1f — check comparison logic!",
-                        idx, method_name, r,
+                        "Reward[%d]: gt MATCHES %s extractor but reward=%.1f — this is a BUG! "
+                        "extracted=%r vs gt_stripped=%r",
+                        idx, method_name, r, pred_val.strip(), gt_stripped,
                     )
     return torch.tensor(rewards, dtype=torch.float32)

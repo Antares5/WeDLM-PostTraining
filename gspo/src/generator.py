@@ -250,16 +250,25 @@ def _compute_entropy(logits: torch.Tensor) -> torch.Tensor:
 def sample_tokens(
     logits: torch.Tensor,              # [N, V]
     temperature: float,
+    bad_token_ids: Optional[List[int]] = None,
 ) -> torch.Tensor:
     """Sample one token per position from logits.
 
     Args:
         logits: [N, V].
         temperature: 0.0 → greedy argmax.
+        bad_token_ids: Token ids to suppress (e.g. mask_token_id, pad_token_id).
+            Their logits are set to -inf before sampling.
 
     Returns:
         sampled_ids: [N] integer token ids.
     """
+    # Suppress bad tokens (mask, pad, etc.) so they can never be sampled.
+    if bad_token_ids:
+        for bid in bad_token_ids:
+            if 0 <= bid < logits.size(-1):
+                logits[:, bid] = float('-inf')
+
     if temperature <= 0.0:
         return logits.argmax(dim=-1)
 
@@ -367,12 +376,17 @@ def _prune_window_prefix(
         state.window_mask_flags = []
     else:
         # Shift window: remove pruned tokens, refill with new masks.
-        refill_count = prune_count
+        # Use actual committed count (may be < prune_count if EOS interrupted).
+        actual_shift = len(newly_generated)
+        if actual_shift == 0:
+            # Nothing was committed (shouldn't happen if full_prune_count > 0).
+            return newly_generated
+        refill_count = actual_shift
         state.window_tokens = (
-            window[prune_count:] + [params.mask_token_id] * refill_count
+            window[actual_shift:] + [params.mask_token_id] * refill_count
         )
         state.window_mask_flags = (
-            flags[prune_count:] + [True] * refill_count
+            flags[actual_shift:] + [True] * refill_count
         )
 
     return newly_generated
@@ -406,6 +420,13 @@ def wedlm_generate(
         eos_token_id = tokenizer.eos_token_id
         if eos_token_id is None:
             raise ValueError("eos_token_id must be provided or set in tokenizer.")
+
+    # Collect token ids that should NEVER be generated.
+    # Only suppress mask_token_id and pad_token_id — other special tokens
+    # (e.g. <|im_end|> for EOS) may be legitimate generation targets.
+    bad_token_ids: List[int] = [params.mask_token_id]
+    if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != params.mask_token_id:
+        bad_token_ids.append(tokenizer.pad_token_id)
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -467,8 +488,8 @@ def wedlm_generate(
         Lc = len(state.committed_ids)
         window_local_idx = mask_positions - Lc                        # [N_masks]
 
-        # 3d. Sample tokens.
-        sampled = sample_tokens(mask_logits, params.temperature)      # [N_masks]
+        # 3d. Sample tokens, suppressing bad token ids.
+        sampled = sample_tokens(mask_logits, params.temperature, bad_token_ids)      # [N_masks]
 
         # 3e. Select which positions to fill.
         entropy = _compute_entropy(mask_logits)                       # [N_masks]
@@ -485,6 +506,14 @@ def wedlm_generate(
         for sel in fill_sel:
             win_pos = int(window_local_idx[sel].item())
             tok = int(sampled[sel].item())
+            # Safety: skip if model still produced a bad token (should not
+            # happen after sample_tokens suppression, but guard defensively).
+            if tok in bad_token_ids:
+                logger.warning(
+                    "Step %d: sampled bad token %d at win_pos %d — skipping fill",
+                    len(state.generated_ids), tok, win_pos,
+                )
+                continue
             if 0 <= win_pos < len(state.window_tokens):
                 state.window_tokens[win_pos] = tok
                 state.window_mask_flags[win_pos] = False
