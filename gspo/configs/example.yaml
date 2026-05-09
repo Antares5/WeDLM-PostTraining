@@ -67,7 +67,7 @@ rebuild_cache: false
 
 # ── DeepSpeed ───────────────────────────────────────────────────────
 use_deepspeed: true
-deepspeed_zero_stage: 2
+deepspeed_zero_stage: 3
 deepspeed_offload_optimizer: true
 deepspeed_offload_param: false
 

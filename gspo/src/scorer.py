@@ -269,13 +269,7 @@ def compute_gspo_scores(
 
     logger.debug("Scorer: %d sequences, %d tokens packed", bs, packed_ids.size(0))
 
-    # ── 2. Accumulators ───────────────────────────────────────────────
-    #    Store per-sample scalar scores (B*G values each), NOT full logits.
-    s_policy_acc: List[torch.Tensor] = []   # list of K tensors [bs]
-    s_old_acc: List[torch.Tensor] = []
-    s_ref_acc: List[torch.Tensor] = []
-
-    # ── Helper: compute scores in one shot, return [bs] tensor ───────
+    # ── Helper ────────────────────────────────────────────────────────
     def _score_one(logits_tensor: torch.Tensor, b: WeDLMBatch) -> torch.Tensor:
         scores, _logs = compute_block_scores(
             logits=logits_tensor,
@@ -292,48 +286,44 @@ def compute_gspo_scores(
         )
         return scores  # [bs]
 
-    for k in range(K):
-        batch = build_wedlm_batch(
-            packed_input_ids=packed_ids,
-            packed_labels=packed_labels,
-            cum_seqlens=cum_seqlens,
-            block_size=scorer_config.block_size,
-            mask_token_id=scorer_config.mask_token_id,
-            mask_per_block=scorer_config.mask_per_block,
-            backend=backend,
-            eps=scorer_config.mask_eps,
-        )
+    def _score_model(model: nn.Module, grad_enabled: bool) -> torch.Tensor:
+        """Run K mask-sample forward passes on one model, return [bs] avg scores."""
+        acc: List[torch.Tensor] = []
+        ctx = torch.enable_grad() if grad_enabled else torch.no_grad()
+        with ctx:
+            for _k in range(K):
+                batch = build_wedlm_batch(
+                    packed_input_ids=packed_ids,
+                    packed_labels=packed_labels,
+                    cum_seqlens=cum_seqlens,
+                    block_size=scorer_config.block_size,
+                    mask_token_id=scorer_config.mask_token_id,
+                    mask_per_block=scorer_config.mask_per_block,
+                    backend=backend,
+                    eps=scorer_config.mask_eps,
+                )
+                logits = _single_model_forward(model, batch, attn_wrapper, backend)
+                s_k = _score_one(logits, batch)
+                acc.append(s_k if grad_enabled else s_k.detach())
+                del logits, batch
+        return torch.stack(acc, dim=0).mean(dim=0)  # [bs]
 
-        # ── Reference model (no grad) ───────────────────────────
-        if ref_model is not None:
-            with torch.no_grad():
-                ref_logits = _single_model_forward(ref_model, batch, attn_wrapper, backend)
-                s_ref_k = _score_one(ref_logits, batch)
-            s_ref_acc.append(s_ref_k.detach())
-            del ref_logits
+    # ── 2. Score models SEQUENTIALLY ──────────────────────────────────
+    #    Process ref first (no-grad), then old (no-grad), then policy (with-grad).
+    #    After each frozen model is done, free its cached memory.
+    #    With DeepSpeed ZeRO-3 the models are shard-managed; we rely on
+    #    torch.cuda.empty_cache() + del to release intermediate tensors.
+    s_ref: Optional[torch.Tensor] = None
 
-        # ── Old-policy model (no grad) ──────────────────────────
-        with torch.no_grad():
-            old_logits = _single_model_forward(old_model, batch, attn_wrapper, backend)
-            s_old_k = _score_one(old_logits, batch)
-        s_old_acc.append(s_old_k.detach())
-        del old_logits
-
-        # ── Policy model (WITH grad) ────────────────────────────
-        #    Compute scores immediately and free the large logits tensor
-        #    to avoid accumulating intermediate activations across K samples.
-        policy_logits = _single_model_forward(policy_model, batch, attn_wrapper, backend)
-        s_policy_k = _score_one(policy_logits, batch)   # [bs], differentiable
-        s_policy_acc.append(s_policy_k)                  # keep grad
-        del policy_logits, batch
-
-    # ── 3. Average across mask samples ─────────────────────────────────
-    s_policy = torch.stack(s_policy_acc, dim=0).mean(dim=0)   # [bs] with grad
-    # Old and ref scores are already detached; just average.
-    s_old_mean = torch.stack(s_old_acc, dim=0).mean(dim=0)    # [bs]
     if ref_model is not None:
-        s_ref_mean = torch.stack(s_ref_acc, dim=0).mean(dim=0)
-    else:
-        s_ref_mean = None
+        s_ref = _score_model(ref_model, grad_enabled=False)
+        del ref_model  # allow GC (caller still holds reference)
+        torch.cuda.empty_cache()
 
-    return s_policy, s_old_mean, s_ref_mean
+    s_old = _score_model(old_model, grad_enabled=False)
+    del old_model
+    torch.cuda.empty_cache()
+
+    s_policy = _score_model(policy_model, grad_enabled=True)
+
+    return s_policy, s_old, s_ref
