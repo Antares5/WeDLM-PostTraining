@@ -229,6 +229,33 @@ def _strip_latex_delimiters(s: str) -> str:
     return s
 
 
+def _extract_balanced_braces(text: str, start_marker: str = r"\boxed{") -> List[str]:
+    """Extract content inside balanced \\boxed{...} (or any marker{...}).
+
+    Handles nested braces like ``\\boxed{\\sqrt{17}}`` or ``\\boxed{\\text{No}}``
+    by tracking brace depth.  Returns all matches found.
+    """
+    results: List[str] = []
+    # Find each occurrence of the start marker.
+    for m in re.finditer(re.escape(start_marker), text):
+        start = m.end()  # position right after the opening {
+        if start >= len(text):
+            continue
+        depth = 1
+        pos = start
+        while pos < len(text) and depth > 0:
+            ch = text[pos]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    results.append(text[start:pos])
+                    break
+            pos += 1
+    return results
+
+
 def extract_gsm8k_answer(text: str) -> Optional[str]:
     """Extract the final answer from a GSM8K-style completion.
 
@@ -242,10 +269,14 @@ def extract_gsm8k_answer(text: str) -> Optional[str]:
 
 
 def extract_boxed_answer(text: str) -> Optional[str]:
-    """Extract answer from \\boxed{...} (common in MATH dataset)."""
-    match = re.findall(r"\\boxed\{([^}]+)\}", text)
-    if match:
-        return match[-1].strip()
+    """Extract answer from \\boxed{...} (common in MATH dataset).
+
+    Uses balanced-brace matching to correctly handle nested braces
+    like ``\\boxed{\\sqrt{17}}`` or ``\\boxed{\\text{No}}``.
+    """
+    results = _extract_balanced_braces(text)
+    if results:
+        return results[-1].strip()
     return None
 
 
@@ -374,10 +405,10 @@ def _extract_deepmath_answer(text: str) -> Optional[str]:
     if m:
         return m[-1].strip()
 
-    # 2. \boxed{...}
-    m = re.findall(r"\\boxed\{([^}]+)\}", text)
-    if m:
-        return m[-1].strip()
+    # 2. \boxed{...} — balanced brace matching.
+    boxed_results = _extract_balanced_braces(text)
+    if boxed_results:
+        return boxed_results[-1].strip()
 
     # 3. Answer: / answer: — capture everything after colon until EOL.
     m = re.findall(r"(?i)answer\s*:\s*([^\n]+)", text)
@@ -447,18 +478,30 @@ def compute_rewards(
             raise ValueError(f"Unknown reward_type: {reward_type}")
         rewards.append(r)
 
-        # ── Debug: log extraction details for first 2 completions ──
-        if idx < 2:
+        # ── Debug: log extraction details for first 3 completions ──
+        if idx < 3:
             gt_stripped = _strip_latex_delimiters(gt)
-            pred = _extract_deepmath_answer(comp) if reward_type == "deepmath" else None
-            if pred is None and reward_type == "math_verify":
-                pred = extract_gsm8k_answer(comp) or extract_boxed_answer(comp)
+            # Try all extractors to see what each would produce.
+            pred_boxed = extract_boxed_answer(comp)
+            pred_deepmath = _extract_deepmath_answer(comp) if reward_type == "deepmath" else None
+            pred_math = None
+            if reward_type == "math_verify":
+                pred_math = extract_gsm8k_answer(comp) or extract_boxed_answer(comp)
             has_answer_marker = bool(re.findall(r"(?i)answer\s*:", comp))
             has_boxed = bool(re.findall(r"\\boxed\{", comp))
-            comp_tail = comp[-120:] if len(comp) > 120 else comp
-            logger.debug(
-                "Reward[%d]: r=%.1f | pred=%r | gt_raw=%r | gt_stripped=%r | "
-                "has_answer_marker=%s has_boxed=%s | comp_tail=%r",
-                idx, r, pred, gt, gt_stripped, has_answer_marker, has_boxed, comp_tail,
+            comp_tail = comp[-200:] if len(comp) > 200 else comp
+            logger.info(
+                "Reward[%d]: r=%.1f | deepmath=%r | boxed=%r | math=%r | "
+                "gt_raw=%r | gt_stripped=%r | answer_marker=%s boxed=%s | tail=%r",
+                idx, r, pred_deepmath, pred_boxed, pred_math,
+                gt, gt_stripped, has_answer_marker, has_boxed, comp_tail,
             )
+            # Also check if ground truth matches any extraction method.
+            gt_clean = gt_stripped.strip().lower()
+            for method_name, pred_val in [("deepmath", pred_deepmath), ("boxed", pred_boxed), ("math", pred_math)]:
+                if pred_val and pred_val.strip().lower() == gt_clean:
+                    logger.warning(
+                        "Reward[%d]: gt MATCHES %s extractor but reward=%.1f — check comparison logic!",
+                        idx, method_name, r,
+                    )
     return torch.tensor(rewards, dtype=torch.float32)
