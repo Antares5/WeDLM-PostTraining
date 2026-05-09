@@ -90,6 +90,10 @@ class GenerationParams:
             fill only the single position with minimum adjusted entropy.
         pos_penalty_factor: Coefficient for position-based entropy penalty.
             Higher values favour filling earlier positions in the window.
+        repetition_window: Number of recent tokens to check for repetition.
+            Set to 0 to disable.
+        max_repeated_ratio: If the fraction of the most common token in the
+            repetition window exceeds this value, stop generation early.
     """
     max_tokens: int = 256
     temperature: float = 1.0
@@ -98,6 +102,8 @@ class GenerationParams:
     mask_token_id: int = _DEFAULT_MASK_TOKEN_ID
     entropy_threshold: Optional[float] = None
     pos_penalty_factor: float = 0.02
+    repetition_window: int = 64
+    max_repeated_ratio: float = 0.75
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -316,6 +322,51 @@ def select_positions_to_fill(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Repetition Detection (Early Stopping)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _check_generation_repetition(
+    generated_ids: List[int],
+    params: GenerationParams,
+) -> bool:
+    """Check if recent generated tokens are excessively repetitive.
+
+    When the model can't terminate via EOS (e.g. it's stuck in a degenerate
+    state), it will often repeat the same token endlessly.  This function
+    detects that pattern and returns True to signal early stopping.
+
+    Args:
+        generated_ids: All completion token ids generated so far.
+        params: Generation parameters.
+
+    Returns:
+        True if generation should be stopped due to excessive repetition.
+    """
+    if params.repetition_window <= 0 or len(generated_ids) < params.repetition_window:
+        return False
+
+    recent = generated_ids[-params.repetition_window:]
+    if not recent:
+        return False
+
+    # Count occurrences of each token id.
+    from collections import Counter
+    counts = Counter(recent)
+    most_common_count = counts.most_common(1)[0][1]
+    ratio = most_common_count / len(recent)
+
+    if ratio >= params.max_repeated_ratio:
+        logger.debug(
+            "Repetition detected: most common token %d appears %d/%d (%.1f%%) in "
+            "last %d tokens — stopping early",
+            counts.most_common(1)[0][0], most_common_count, len(recent),
+            ratio * 100, params.repetition_window,
+        )
+        return True
+    return False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Window Management
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -422,11 +473,13 @@ def wedlm_generate(
             raise ValueError("eos_token_id must be provided or set in tokenizer.")
 
     # Collect token ids that should NEVER be generated.
-    # Only suppress mask_token_id and pad_token_id — other special tokens
-    # (e.g. <|im_end|> for EOS) may be legitimate generation targets.
+    # CRITICAL: Do NOT suppress eos_token_id — the model must be able to
+    # generate <|im_end|> to terminate naturally.  pad_token_id is often
+    # set to the same token, so always exclude eos_token_id.
     bad_token_ids: List[int] = [params.mask_token_id]
-    if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != params.mask_token_id:
-        bad_token_ids.append(tokenizer.pad_token_id)
+    _pad = tokenizer.pad_token_id
+    if _pad is not None and _pad != params.mask_token_id and _pad != eos_token_id:
+        bad_token_ids.append(_pad)
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -536,7 +589,16 @@ def wedlm_generate(
             break
 
         # 3h. Prune confirmed prefix & check stop conditions.
-        _prune_window_prefix(state, params, eos_token_id)
+        newly_pruned = _prune_window_prefix(state, params, eos_token_id)
+
+        # 3i. Early stop: detect repetitive generation (model stuck in loop).
+        # Only check when new tokens were actually committed this step.
+        if newly_pruned and _check_generation_repetition(state.generated_ids, params):
+            logger.info(
+                "Early stop at %d tokens due to repetition",
+                len(state.generated_ids),
+            )
+            state.is_finished = True
 
         # Guard: if window became empty, stop.
         if len(state.window_tokens) == 0:
