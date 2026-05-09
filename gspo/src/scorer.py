@@ -105,11 +105,13 @@ def _tokenize_prompt_completion(
     prompt_len = len(prompt_ids)
 
     if len(full_ids) > effective_max:
-        # Truncate completion to fit.
+        # Keep prompt in full, then keep the LAST max_comp_len tokens
+        # of the completion (where "Answer: X" typically appears).
         max_comp_len = effective_max - prompt_len
         if max_comp_len <= 0:
             return None
-        full_ids = prompt_ids + completion_ids[:max_comp_len]
+        # Truncate from the BEGINNING of completion, preserving the tail.
+        full_ids = prompt_ids + completion_ids[-max_comp_len:]
 
     if num_reserved > 0:
         im_end_id = get_im_end_token_id(tokenizer)

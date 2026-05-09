@@ -10,7 +10,7 @@ trust_remote_code: true
 
 # ── Data ────────────────────────────────────────────────────────────
 train_data: "data/train-deepmath-00000-of-00001.parquet"
-max_seq_length: 2048
+max_seq_length: 1536
 
 # ── Mode ────────────────────────────────────────────────────────────
 training_mode: "gspo"
@@ -28,10 +28,10 @@ gspo_kl_estimator: "k3"            # "k3" | "reverse_kl" | "none"
 gspo_num_mask_samples: 2           # K: mask MC samples for score averaging
 
 # ── Generation ──────────────────────────────────────────────────────
-gspo_gen_max_tokens: 2048
+gspo_gen_max_tokens: 768
 gspo_gen_temperature: 1.0
 gspo_gen_window_size: 16
-gspo_gen_entropy_threshold: 0.4  # null = single-position fill per step
+gspo_gen_entropy_threshold: 0.4 
 gspo_gen_pos_penalty_factor: 0.02
 
 # ── Reward ──────────────────────────────────────────────────────────
