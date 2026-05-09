@@ -12,6 +12,7 @@ The trainer orchestrates:
 from __future__ import annotations
 
 import os
+import re
 import math
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -301,10 +302,27 @@ class GSPOTrainer:
 
         # Debug: log first completion every N steps to verify format.
         if self.global_step % self.config.logging_steps == 0 and all_completion_texts:
-            sample_comp = all_completion_texts[0][:200]
+            sample_comp = all_completion_texts[0]
             sample_gt = all_ground_truths[0]
-            logger.info("Sample completion: %r", sample_comp)
-            logger.info("Ground truth: %r", sample_gt)
+            # Head + tail: show beginning of reasoning and the final answer portion.
+            head = sample_comp[:200]
+            tail = sample_comp[-200:] if len(sample_comp) > 200 else ""
+            logger.info("Sample completion HEAD: %r", head)
+            if tail:
+                logger.info("Sample completion TAIL: %r", tail)
+            logger.info("Ground truth (raw): %r", sample_gt)
+            # Show whether key answer markers are present.
+            from loss import _extract_deepmath_answer, _strip_latex_delimiters
+            pred = _extract_deepmath_answer(sample_comp)
+            gt_stripped = _strip_latex_delimiters(sample_gt)
+            has_answer = bool(re.findall(r"(?i)answer\s*:", sample_comp))
+            has_boxed = bool(re.findall(r"\\boxed\{", sample_comp))
+            has_hash = "####" in sample_comp
+            logger.info(
+                "Reward preview: extracted=%r  gt_stripped=%r  "
+                "markers: answer=%s boxed=%s hash=%s",
+                pred, gt_stripped, has_answer, has_boxed, has_hash,
+            )
 
         # ── Phase 2: Compute rewards ──────────────────────────────────
         rewards = compute_rewards(

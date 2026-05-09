@@ -202,6 +202,33 @@ def compute_grpo_loss(
 # Reward Functions
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _strip_latex_delimiters(s: str) -> str:
+    """Strip LaTeX math-mode delimiters from a ground-truth string.
+
+    Handles:
+      - ``$...$``  (inline math)
+      - ``$$...$$`` (display math)
+      - ``\\(...\\)`` (LaTeX inline)
+      - ``\\[...\\]`` (LaTeX display)
+
+    Returns the inner content with outer whitespace trimmed.
+    """
+    s = s.strip()
+    # $$ ... $$
+    if s.startswith("$$") and s.endswith("$$"):
+        s = s[2:-2].strip()
+    # \[ ... \]
+    elif s.startswith("\\[") and s.endswith("\\]"):
+        s = s[2:-2].strip()
+    # $ ... $ (but not $$$)
+    elif s.startswith("$") and s.endswith("$") and not s.startswith("$$"):
+        s = s[1:-1].strip()
+    # \( ... \)
+    elif s.startswith("\\(") and s.endswith("\\)"):
+        s = s[2:-2].strip()
+    return s
+
+
 def extract_gsm8k_answer(text: str) -> Optional[str]:
     """Extract the final answer from a GSM8K-style completion.
 
@@ -250,6 +277,9 @@ def math_reward(
         ground_truth: Expected answer string.
         tolerance: Relative tolerance for float comparison.
     """
+    # ── Normalise ground truth ──────────────────────────────────
+    gt_stripped = _strip_latex_delimiters(ground_truth)
+
     # Try GSM8K format first.
     pred = extract_gsm8k_answer(completion_text)
     if pred is None:
@@ -263,7 +293,7 @@ def math_reward(
         return 0.0
 
     pred_num = normalize_number(pred)
-    gt_num = normalize_number(ground_truth)
+    gt_num = normalize_number(gt_stripped)
 
     if pred_num is not None and gt_num is not None:
         if abs(gt_num) < 1e-12:
@@ -273,7 +303,7 @@ def math_reward(
 
     # String comparison fallback.
     pred_clean = pred.strip().lower().replace(",", "")
-    gt_clean = ground_truth.strip().lower().replace(",", "")
+    gt_clean = gt_stripped.strip().lower().replace(",", "")
     return 1.0 if pred_clean == gt_clean else 0.0
 
 
@@ -294,6 +324,9 @@ def deepmath_reward(
        answer markers like "Answer:", "Therefore", etc.)
     2. Compares case-insensitively for yes/no, numerically for numbers.
     """
+    # ── Normalise ground truth ──────────────────────────────────
+    gt_stripped = _strip_latex_delimiters(ground_truth)
+
     # ── 1. Extract final answer from completion ──────────────────
     pred = _extract_deepmath_answer(completion_text)
     if pred is None:
@@ -301,7 +334,7 @@ def deepmath_reward(
 
     # ── 2. Clean & compare ──────────────────────────────────────
     pred_clean = pred.strip().lower()
-    gt_clean = ground_truth.strip().lower()
+    gt_clean = gt_stripped.strip().lower()
 
     # Exact match after cleaning.
     if pred_clean == gt_clean:
@@ -331,8 +364,8 @@ def _extract_deepmath_answer(text: str) -> Optional[str]:
     """Extract the final answer from a DeepMath-style completion.
 
     Strategy (ordered by priority):
-    1. Explicit markers: ``####``, ``\\boxed{}``, ``Answer:``
-    2. "the answer is/must be/would be X"
+    1. Explicit markers: ``####``, ``\\boxed{}``, ``Answer:``, ``answer is``
+    2. "the answer is/must be/would be X" (multi-word)
     3. Last standalone Yes/No or number in the text (fallback)
     4. Last non-empty line (final fallback)
     """
@@ -346,21 +379,30 @@ def _extract_deepmath_answer(text: str) -> Optional[str]:
     if m:
         return m[-1].strip()
 
-    # 3. Answer: / answer: (with colon).
-    m = re.findall(r"(?i)answer\s*:\s*(.+?)(?:\.|$)", text)
+    # 3. Answer: / answer: — capture everything after colon until EOL.
+    m = re.findall(r"(?i)answer\s*:\s*([^\n]+)", text)
     if m:
-        return m[-1].strip()
+        return m[-1].strip().rstrip(".")
 
-    # 4. "the answer is/must be/would be/should be X"
+    # 4. "the answer is/must be/would be/should be X" — multi-word aware.
     m = re.findall(
         r"(?i)the\s+answer\s+(?:is|must\s+be|would\s+be|should\s+be)\s+"
-        r"([\w\-]+(?:\.\d+)?)",
+        r"(.+?)(?:\.\s*(?:$|\n)|$)",
         text,
     )
     if m:
         return m[-1].strip()
 
-    # 5. Fallback: last standalone Yes/No/true/false or number.
+    # 5. "Therefore/Thus/Hence the answer ..." patterns.
+    m = re.findall(
+        r"(?i)(?:therefore|thus|hence|so|finally)[,.]?\s+(?:the\s+)?(?:answer|result|value)\s+(?:is|=)\s+"
+        r"(.+?)(?:\.\s*(?:$|\n)|$)",
+        text,
+    )
+    if m:
+        return m[-1].strip()
+
+    # 6. Fallback: last standalone Yes/No/true/false or number.
     yn = re.findall(r"\b(yes|no|true|false)\b", text, re.IGNORECASE)
     nums = re.findall(r"-?[\d,]+(?:\.\d+)?", text)
     if yn:
@@ -368,7 +410,7 @@ def _extract_deepmath_answer(text: str) -> Optional[str]:
     if nums:
         return nums[-1].strip()
 
-    # 6. Last non-empty line (skip LaTeX structural lines).
+    # 7. Last non-empty line (skip LaTeX structural lines).
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
     latex_struct = {r"\begin{cases}", r"\end{cases}", r"\begin{array}", r"\end{array}", r"\\"}
     for line in reversed(lines):
@@ -391,10 +433,10 @@ def compute_rewards(
         reward_type: ``"math_verify"``, ``"deepmath"``, or ``"string_match"``.
 
     Returns:
-        rewards: Float tensor [B].
+        rewards: Float tensor [N].
     """
     rewards = []
-    for comp, gt in zip(completion_texts, ground_truths):
+    for idx, (comp, gt) in enumerate(zip(completion_texts, ground_truths)):
         if reward_type == "math_verify":
             r = math_reward(comp, gt)
         elif reward_type == "deepmath":
@@ -404,4 +446,19 @@ def compute_rewards(
         else:
             raise ValueError(f"Unknown reward_type: {reward_type}")
         rewards.append(r)
+
+        # ── Debug: log extraction details for first 2 completions ──
+        if idx < 2:
+            gt_stripped = _strip_latex_delimiters(gt)
+            pred = _extract_deepmath_answer(comp) if reward_type == "deepmath" else None
+            if pred is None and reward_type == "math_verify":
+                pred = extract_gsm8k_answer(comp) or extract_boxed_answer(comp)
+            has_answer_marker = bool(re.findall(r"(?i)answer\s*:", comp))
+            has_boxed = bool(re.findall(r"\\boxed\{", comp))
+            comp_tail = comp[-120:] if len(comp) > 120 else comp
+            logger.debug(
+                "Reward[%d]: r=%.1f | pred=%r | gt_raw=%r | gt_stripped=%r | "
+                "has_answer_marker=%s has_boxed=%s | comp_tail=%r",
+                idx, r, pred, gt, gt_stripped, has_answer_marker, has_boxed, comp_tail,
+            )
     return torch.tensor(rewards, dtype=torch.float32)
