@@ -378,27 +378,15 @@ def wedlm_generate(
     backend: str,
     eos_token_id: Optional[int] = None,
     seed: Optional[int] = None,
+    system_prompt: Optional[str] = None,
 ) -> Tuple[List[int], WeDLMGenerationState]:
     """Generate completion tokens using WeDLM sliding-window decoding.
 
-    This is a training-compatible lightweight generator.  It does NOT use
-    the multi-process ``LLMEngine``; instead it directly calls
-    ``wedlm_forward`` on the HuggingFace model with generation-style
-    WeDLMBatch instances.
-
     Args:
-        model: HuggingFace AutoModelForCausalLM (already on correct device).
-        tokenizer: HuggingFace tokenizer (used to encode prompt, get eos).
-        prompt: Raw text prompt.
-        params: Generation hyper-parameters.
-        attn_wrapper: Attention wrapper from ``dpo.src.attention``.
-        backend: ``"dense"`` or ``"magi"``.
-        eos_token_id: EOS token id.  If None, falls back to tokenizer.eos_token_id.
-        seed: Optional random seed for reproducibility.
-
-    Returns:
-        completion_ids: List of generated token ids (excluding prompt).
-        state: Final generation state (for inspection / debugging).
+        ...
+        system_prompt: Optional system instruction prepended to the prompt
+            (e.g. to guide answer format).  If given, the tokenized prompt
+            becomes ``system_prompt + "\n\n" + prompt`` as a chat template.
     """
     if eos_token_id is None:
         eos_token_id = tokenizer.eos_token_id
@@ -410,8 +398,20 @@ def wedlm_generate(
 
     device = next(model.parameters()).device
 
-    # ── 1. Tokenize prompt ──────────────────────────────────────────────
-    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    # ── 1. Tokenize prompt (with optional system instruction) ────────
+    if system_prompt:
+        # Build chat-style messages: system + user.
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+        full_prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+    else:
+        full_prompt_text = prompt
+
+    prompt_ids = tokenizer.encode(full_prompt_text, add_special_tokens=False)
     if not prompt_ids:
         raise ValueError("Prompt tokenized to empty list.")
 

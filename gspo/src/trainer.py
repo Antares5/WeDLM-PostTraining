@@ -231,6 +231,16 @@ class GSPOTrainer:
             pos_penalty_factor=self.config.gspo_gen_pos_penalty_factor,
         )
 
+    @staticmethod
+    def _make_system_prompt() -> str:
+        return (
+            "You are a math problem solver. "
+            "For each question, think step by step carefully and explain your reasoning in detail. "
+            "Show all your work and calculations. "
+            "After your reasoning, you MUST end with a single line giving the final answer "
+            "in exactly this format: Answer: <your answer>"
+        )
+
     # ── Training step ────────────────────────────────────────────────
     def train_step(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """One GSPO training step (online generation + scoring + GRPO loss).
@@ -247,6 +257,7 @@ class GSPOTrainer:
         B = len(batch["prompt_text"])
         G = self.config.gspo_group_size
         gen_params = self._make_gen_params()
+        system_prompt = self._make_system_prompt()
 
         # Unwrapped model for generation & scoring (avoid accelerate wrapping issues).
         policy_unwrapped = self.accelerator.unwrap_model(self.model)
@@ -276,11 +287,19 @@ class GSPOTrainer:
                     backend=self.backend,
                     eos_token_id=eos_id,
                     seed=seed,
+                    system_prompt=system_prompt,
                 )
                 comp_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
                 all_completion_ids.append(completion_ids)
                 all_completion_texts.append(comp_text)
                 all_ground_truths.append(gt)
+
+        # Debug: log first completion every N steps to verify format.
+        if self.global_step % self.config.logging_steps == 0 and all_completion_texts:
+            sample_comp = all_completion_texts[0][:200]
+            sample_gt = all_ground_truths[0]
+            logger.info("Sample completion: %r", sample_comp)
+            logger.info("Ground truth: %r", sample_gt)
 
         # ── Phase 2: Compute rewards ──────────────────────────────────
         rewards = compute_rewards(
@@ -359,7 +378,11 @@ class GSPOTrainer:
 
             for batch in self.train_dataloader:
                 with self.accelerator.accumulate(self.model):
-                    loss, logs = self.train_step(batch)
+                    try:
+                        loss, logs = self.train_step(batch)
+                    except Exception as e:
+                        logger.error("Error at step %d: %s", self.global_step, e, exc_info=True)
+                        raise
                     self.accelerator.backward(loss)
 
                     if self.accelerator.sync_gradients:
