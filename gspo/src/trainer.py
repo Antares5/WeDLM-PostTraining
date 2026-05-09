@@ -27,11 +27,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, get_scheduler
 from config import GSPOConfig
 from data import GSPOPromptDataset, gspo_collate_fn
 from generator import (
-    MASK_TOKEN_ID,
+    get_mask_token_id,
     GenerationParams,
     wedlm_generate,
 )
-from scorer import ScorerConfig, compute_gspo_scores
+from scorer import ScorerConfig, compute_gspo_scores, _get_mask_token_id as _scorer_mask_token
 from loss import compute_grpo_loss, compute_rewards
 from src.attention import check_backend_available, get_available_backend, get_attention_wrapper
 
@@ -122,6 +122,11 @@ class GSPOTrainer:
         if hasattr(self.attn_wrapper, "to"):
             self.attn_wrapper = self.attn_wrapper.to(self.accelerator.device)
         self.backend = backend
+
+        # Read mask token id from model config (not hardcoded).
+        self.mask_token_id = get_mask_token_id(self.model)
+        logger.info("Mask token ID: %d (vocab size: %d)",
+                     self.mask_token_id, self.model.config.vocab_size)
 
         # Dataset.
         self.train_dataset = GSPOPromptDataset(
@@ -226,7 +231,7 @@ class GSPOTrainer:
             temperature=self.config.gspo_gen_temperature,
             block_size=self.config.block_size,
             window_size=self.config.gspo_gen_window_size,
-            mask_token_id=MASK_TOKEN_ID,
+            mask_token_id=self.mask_token_id,
             entropy_threshold=self.config.gspo_gen_entropy_threshold,
             pos_penalty_factor=self.config.gspo_gen_pos_penalty_factor,
         )
@@ -314,7 +319,7 @@ class GSPOTrainer:
 
         scorer_cfg = ScorerConfig(
             block_size=self.config.block_size,
-            mask_token_id=MASK_TOKEN_ID,
+            mask_token_id=self.mask_token_id,
             max_seq_length=self.config.max_seq_length,
             num_learnable_im_end=self.config.num_learnable_im_end,
             mask_per_block=self.config.mask_per_block,

@@ -31,7 +31,7 @@ gspo_num_mask_samples: 2           # K: mask MC samples for score averaging
 gspo_gen_max_tokens: 2048
 gspo_gen_temperature: 1.0
 gspo_gen_window_size: 16
-# gspo_gen_entropy_threshold: null  # null = single-position fill per step
+gspo_gen_entropy_threshold: 0.4  # null = single-position fill per step
 gspo_gen_pos_penalty_factor: 0.02
 
 # ── Reward ──────────────────────────────────────────────────────────
@@ -67,7 +67,7 @@ rebuild_cache: false
 
 # ── DeepSpeed ───────────────────────────────────────────────────────
 use_deepspeed: true
-deepspeed_zero_stage: 3
+deepspeed_zero_stage: 2
 deepspeed_offload_optimizer: true
 deepspeed_offload_param: false
 

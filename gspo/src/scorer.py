@@ -35,7 +35,16 @@ from src.data import get_im_end_token_id
 
 logger = logging.getLogger(__name__)
 
-MASK_TOKEN_ID = 151665
+MASK_TOKEN_ID = 151665  # default fallback; prefer model.config.mask_token_id
+
+
+def _get_mask_token_id(model) -> int:
+    """Read mask token id from a WeDLM model HF config."""
+    if hasattr(model, "config") and hasattr(model.config, "mask_token_id"):
+        mid = model.config.mask_token_id
+        if mid is not None:
+            return int(mid)
+    return MASK_TOKEN_ID
 
 
 # ──────────────────────────────────────────────────────────────────────────────

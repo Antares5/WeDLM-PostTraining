@@ -32,7 +32,21 @@ from src.model import wedlm_forward
 
 logger = logging.getLogger(__name__)
 
-MASK_TOKEN_ID = 151665
+# Default fallback; prefer reading from model config.
+_DEFAULT_MASK_TOKEN_ID = 151665
+
+
+def get_mask_token_id(model) -> int:
+    """Read the mask token id from a WeDLM model config.
+
+    Tries ``model.config.mask_token_id`` first (HF config),
+    then falls back to the hard-coded default.
+    """
+    if hasattr(model, "config") and hasattr(model.config, "mask_token_id"):
+        mid = model.config.mask_token_id
+        if mid is not None:
+            return int(mid)
+    return _DEFAULT_MASK_TOKEN_ID
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -81,7 +95,7 @@ class GenerationParams:
     temperature: float = 1.0
     block_size: int = 32
     window_size: int = 16
-    mask_token_id: int = MASK_TOKEN_ID
+    mask_token_id: int = _DEFAULT_MASK_TOKEN_ID
     entropy_threshold: Optional[float] = None
     pos_penalty_factor: float = 0.02
 
