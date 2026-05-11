@@ -1,0 +1,69 @@
+# ── GSPO On-Policy Training Configuration ──
+
+# Model
+model_path: "tencent/WeDLM-8B-Base"
+trust_remote_code: true
+
+# Data (JSONL of prompts in chat format, one per line)
+train_data: "data/prompts.jsonl"
+max_seq_length: 2048
+
+# Mode
+training_mode: "gspo"
+
+# ── GSPO specific ──
+gspo_group_size: 4                  # G: responses per prompt
+gspo_num_mask_samples: 4            # K: MC masking estimates per response
+gspo_temperature: 0.8               # generation temperature
+gspo_max_new_tokens: 512            # max tokens to generate
+gspo_entropy_threshold: 0.4         # parallel decoding entropy threshold
+gspo_pos_penalty_factor: 0.02       # position penalty for left-to-right bias
+gspo_sync_every_n_steps: 10         # sync training→generator every N steps
+gspo_window_size: 16                # WeDLM sliding window size for decode
+gspo_kvcache_block_size: 4096       # KV cache block size
+
+# Reward model (local path or API — implementation TBD)
+reward_model_path: null
+
+# ── WeDLM ──
+block_size: 32
+mask_per_block: true
+loss_weighting_scheme: "weighted"
+mask_eps: 1.0e-8
+num_learnable_im_end: 0
+
+# AR loss (keep enabled for S_θ stability)
+enable_ar_loss: false          # GSPO uses REINFORCE loss only
+ar_loss_weight: 0.0
+
+# Attention: "magi" or "dense"
+attention_backend: "dense"
+
+# ── Training ──
+output_dir: "outputs/gspo-run"
+num_train_epochs: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-6               # lower LR for RL stability
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.1
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+# Cache
+rebuild_cache: false
+
+# DeepSpeed
+use_deepspeed: true
+deepspeed_zero_stage: 2
+deepspeed_offload_optimizer: true
+deepspeed_offload_param: false
+
+# Logging
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+
+# Device & Seed
+bf16: true
+seed: 42
