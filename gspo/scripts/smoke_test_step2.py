@@ -313,7 +313,7 @@ adv_mean = logs5["gspo/adv_mean"].item()
 check("5-pipeline: adv_mean ≈ 0 (group-normalized)", abs(adv_mean) < 1e-6,
       f"adv_mean = {adv_mean:.8f}")
 
-print(f"  5-pipeline: loss={loss.item():.6f}, adv_mean={adv_mean:.6f}")
+print(f"  5-pipeline: loss={loss.detach().item():.6f}, adv_mean={adv_mean:.6f}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -351,13 +351,17 @@ if args.model_path:
         )
         model.eval()
 
+        # Determine the primary device of the model
+        model_device = next(model.parameters()).device
+        print(f"  Model device: {model_device}")
+
         head_dim = model.config.hidden_size // model.config.num_attention_heads
         wrapper = get_attention_wrapper(backend, head_dim, deterministic=False)
 
-        # Build a small batch, forward, compute scores
-        test_ids = torch.randint(0, tokenizer.vocab_size, (64,))
+        # Build a small batch on the same device as the model
+        test_ids = torch.randint(0, tokenizer.vocab_size, (64,), device=model_device)
         test_labels = test_ids.clone()
-        test_cum = torch.tensor([0, 64])
+        test_cum = torch.tensor([0, 64], device=model_device)
 
         test_batch = build_wedlm_batch(
             packed_input_ids=test_ids,

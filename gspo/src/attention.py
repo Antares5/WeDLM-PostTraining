@@ -1,7 +1,7 @@
 # coding=utf-8
 """Attention backend utilities for WeDLM training.
 
-Self-contained copy derived from dpo/src/attention.py.
+Self-contained — no external dependencies on dpo/ or finetune/.
 """
 
 from typing import Optional, Dict
