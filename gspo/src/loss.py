@@ -1,26 +1,132 @@
 # coding=utf-8
-"""GSPO REINFORCE loss for block diffusion language models.
+"""GSPO REINFORCE loss and block-diffusion score functions."""
 
-Mathematical formulation
-------------------------
-For each prompt x, sample G responses {y_1, ..., y_G} from the current policy π_θ.
-Compute rewards r_i = RM(x, y_i) and group-normalized advantages:
-
-    μ = (1/G) Σ r_i
-    σ = std(r_i)
-    A_i = (r_i - μ) / (σ + ε)
-
-The REINFORCE loss with score proxy S_θ(y|x) (block-level pseudo-log-likelihood):
-
-    L(θ) = - (1/(B·G)) Σ_i A_i · S_θ(y_i | x_i)
-
-This is the "group baseline" variant — no importance ratio needed,
-which avoids the exp(noise) problem of importance sampling with MC score estimates.
-"""
-
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Literal
 import torch
+import torch.nn.functional as F
 
+
+# ═══════════════════════════════════════════════════════════════
+# Block-level score function (pseudo-log-likelihood estimator)
+# ═══════════════════════════════════════════════════════════════
+
+def compute_block_scores(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    masked_indices: torch.Tensor,
+    p_mask: torch.Tensor,
+    logical_positions: torch.Tensor,
+    cum_seqlens: torch.Tensor,
+    block_size: int,
+    weighting_scheme: Literal["uniform", "weighted"] = "weighted",
+    block_reduce: Literal["mean", "sum"] = "mean",
+    seq_reduce: Literal["mean", "sum"] = "mean",
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Compute block-level sequence scores from masked token log-probabilities.
+
+    This is the differentiable score function S_θ(y|x) used as a proxy
+    for log π_θ(y|x) in the REINFORCE estimator.
+
+    Equivalent to dpo.src.loss.compute_block_scores — self-contained copy.
+    """
+    if block_size <= 0:
+        raise ValueError("block_size must be a positive integer.")
+    if weighting_scheme not in ["uniform", "weighted"]:
+        raise ValueError(f"Unknown weighting_scheme: {weighting_scheme}")
+    if block_reduce not in ["mean", "sum"]:
+        raise ValueError(f"Unknown block_reduce: {block_reduce}")
+    if seq_reduce not in ["mean", "sum"]:
+        raise ValueError(f"Unknown seq_reduce: {seq_reduce}")
+
+    device = logits.device
+    dtype = logits.dtype
+    batch_size = cum_seqlens.numel() - 1
+    if batch_size <= 0:
+        empty = torch.empty((0,), device=device, dtype=dtype)
+        return empty, {
+            "score/mean": torch.tensor(0.0, device=device),
+            "score/num_masked_tokens": torch.tensor(0.0, device=device),
+            "score/num_blocks": torch.tensor(0.0, device=device),
+            "score/avg_blocks_per_seq": torch.tensor(0.0, device=device),
+        }
+
+    safe_targets = targets.clone().long()
+    safe_targets[safe_targets < 0] = 0
+    token_nll = F.cross_entropy(logits, safe_targets, reduction="none")
+    token_logps = -token_nll.to(dtype)
+
+    weights = torch.zeros_like(token_logps, dtype=dtype)
+    if weighting_scheme == "weighted":
+        masked_weights = 1.0 / (p_mask[masked_indices].to(dtype) + eps)
+    else:
+        num_masked = int(masked_indices.sum().item())
+        masked_weights = torch.ones((num_masked,), device=device, dtype=dtype)
+
+    if masked_weights.numel() > 0:
+        weights[masked_indices] = masked_weights
+
+    sequence_scores = []
+    total_blocks = torch.tensor(0.0, device=device, dtype=dtype)
+    total_masked_tokens = masked_indices.sum().to(dtype)
+
+    for sample_idx in range(batch_size):
+        seq_start = int(cum_seqlens[sample_idx].item())
+        seq_end = int(cum_seqlens[sample_idx + 1].item())
+        if seq_end <= seq_start:
+            sequence_scores.append(token_logps.sum() * 0.0)
+            continue
+
+        seq_mask = masked_indices[seq_start:seq_end]
+        if not torch.any(seq_mask):
+            sequence_scores.append(token_logps[seq_start:seq_end].sum() * 0.0)
+            continue
+
+        seq_logps = token_logps[seq_start:seq_end][seq_mask]
+        seq_weights = weights[seq_start:seq_end][seq_mask]
+        seq_positions = logical_positions[seq_start:seq_end][seq_mask]
+        seq_block_ids = torch.div(seq_positions, block_size, rounding_mode="floor")
+
+        unique_blocks = torch.unique(seq_block_ids, sorted=True)
+        total_blocks = total_blocks + unique_blocks.numel()
+        block_scores = []
+
+        for block_id in unique_blocks:
+            block_mask = seq_block_ids == block_id
+            block_logps = seq_logps[block_mask]
+            block_weights_ = seq_weights[block_mask]
+
+            if block_reduce == "sum":
+                block_score = (block_logps * block_weights_).sum()
+            else:
+                denom = block_weights_.sum().clamp_min(eps)
+                block_score = (block_logps * block_weights_).sum() / denom
+
+            block_scores.append(block_score)
+
+        if len(block_scores) == 0:
+            sequence_scores.append(seq_logps.sum() * 0.0)
+            continue
+
+        block_scores_t = torch.stack(block_scores)
+        if seq_reduce == "sum":
+            sequence_scores.append(block_scores_t.sum())
+        else:
+            sequence_scores.append(block_scores_t.mean())
+
+    sequence_scores_t = torch.stack(sequence_scores)
+    avg_blocks = total_blocks / max(batch_size, 1)
+    return sequence_scores_t, {
+        "score/mean": sequence_scores_t.mean().detach(),
+        "score/num_masked_tokens": total_masked_tokens.detach(),
+        "score/num_blocks": total_blocks.detach(),
+        "score/avg_blocks_per_seq": avg_blocks.detach(),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# GSPO REINFORCE loss
+# ═══════════════════════════════════════════════════════════════
 
 def compute_gspo_loss(
     scores: torch.Tensor,
