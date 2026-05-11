@@ -58,6 +58,24 @@ def compute_gspo_loss(
             f"prompt_indices {prompt_indices.size(0)}"
         )
 
+    if N == 0:
+        # Empty batch → zero loss (edge case, no-op)
+        device = scores.device
+        dtype = scores.dtype
+        zero = torch.tensor(0.0, device=device, dtype=dtype)
+        return zero, {
+            "gspo/loss": zero,
+            "gspo/adv_mean": zero,
+            "gspo/adv_std": zero,
+            "gspo/adv_max": zero,
+            "gspo/adv_min": zero,
+            "gspo/score_mean": zero,
+            "gspo/score_std": zero,
+            "gspo/reward_mean": zero,
+            "gspo/reward_std": zero,
+            "gspo/score_reward_acc": torch.tensor(0.0, device=device),
+        }
+
     B = int(prompt_indices.max().item()) + 1
     if B <= 0:
         raise ValueError("No prompts found (prompt_indices is empty or zero-only)")

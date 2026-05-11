@@ -128,18 +128,17 @@ loss, logs = compute_gspo_loss(scores, rewards, prompt_idx)
 
 check("2a-basic: loss is scalar", loss.dim() == 0)
 check("2a-basic: loss is finite", torch.isfinite(loss))
-check("2a-basic: loss > 0 (higher score should have positive advantage)",
-      loss.item() > 0,
+# REINFORCE loss = -mean(A_i * S_i). When A_i and S_i are positively correlated,
+# the loss is negative, which is correct (gradient will pull down on low-advantage
+# responses and up on high-advantage ones).
+check("2a-basic: loss is nonzero (gradient signal exists)",
+      abs(loss.item()) > 0,
       f"loss={loss.item():.6f}")
 
-# Expected: advantage for higher reward = +1, for lower = -1
-# L = -[(1 * 0.5 + (-1) * 0.3)/2 + (1 * 0.8 + (-1) * 0.2)/2] / 2
-#   = -[(0.2)/2 + (0.6)/2] / 2 = -[0.1 + 0.3] / 2 = -0.2
-# Wait: advantage is (r-mu)/sigma. For group0: r=[1.0, 0.0], mu=0.5, sigma=0.707+eps
-# A0 ≈ (1.0-0.5)/0.707 ≈ 0.707, A1 ≈ -0.707
-# L = -[(0.707*0.5 + (-0.707)*0.3)/2 + (0.707*0.8 + (-0.707)*0.2)/2]/2
-#   = -[(0.3535-0.2121)/2 + (0.5656-0.1414)/2]/2 = -[0.0707+0.2121]/2 = -0.1414
-print(f"  2a-basic: loss={loss.item():.6f}, adv_mean={logs['gspo/adv_mean'].item():.6f}")
+# Expected: advantage for higher reward = +0.707, for lower = -0.707
+# L = -[(0.707*0.5 + (-0.707)*0.3)/2 + (0.707*0.8 + (-0.707)*0.2)/2] / 2
+#   = -[0.0707 + 0.2121] / 2 ≈ -0.1414
+print(f"  2a-basic: loss={loss.item():.6f} (expected ≈ -0.1414), adv_mean={logs['gspo/adv_mean'].item():.6f}")
 
 # 2b: All required log keys present
 required_keys = [
@@ -197,15 +196,16 @@ loss_s, logs_s = compute_gspo_loss(scores_s, rewards_s, prompt_s)
 check("3c-single-response: loss ≈ 0 (skipped)", abs(loss_s.item()) < 5e-7,
       f"loss={loss_s.item():.10f}")
 
-# 3d: Empty input
+# 3d: Empty input → should return zero (no-op), not crash
 try:
     scores_e = torch.tensor([])
     rewards_e = torch.tensor([])
     prompt_e = torch.tensor([])
     loss_e, _ = compute_gspo_loss(scores_e, rewards_e, prompt_e)
-    check("3d-empty: should raise or return", True)  # no crash is pass
-except ValueError:
-    check("3d-empty: raises ValueError (expected)", True)
+    check("3d-empty: no crash, returns zero loss", abs(loss_e.item()) < 1e-7,
+          f"loss={loss_e.item():.10f}")
+except Exception as e:
+    check("3d-empty: should not crash", False, f"Unexpected {type(e).__name__}: {e}")
 
 # 3e: Mismatched shapes
 try:
