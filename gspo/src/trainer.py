@@ -1,451 +1,442 @@
 # coding=utf-8
-"""GSPO On-Policy Trainer.
+"""GSPO Trainer with DeepSpeed multi-GPU support.
 
-Core training loop for Group Sample Policy Optimization on WeDLM.
+Architecture
+------------
+The GSPO trainer follows the same Accelerate + DeepSpeed pattern as the DPO
+trainer in dpo/src/trainer.py, but implements the 3-phase GSPO loop:
 
-Phase 1 (no grad):  generate G responses per prompt using current policy
-Phase 2 (with grad): compute block scores S_θ(y|x), REINFORCE loss, backward
-Phase 3 (periodic):   sync training weights → generator
+  Phase 1 (external):  Generate responses from current policy → token ids + rewards
+  Phase 2 (train step):  wedlm_forward → compute_block_scores → compute_gspo_loss → backward
+  Phase 3 (periodic):    Sync weights to generator (handled externally, every K steps)
+
+For the MVP (Step 3), Phase 1 uses mock/offline responses. Real on-policy
+generation will be integrated in Step 4.
 """
 
 import os
-import logging
 import math
-from typing import Dict, List, Optional, Tuple
+import logging
+from typing import Dict, List, Tuple, Optional
 
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
+from accelerate import Accelerator
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_scheduler
 
 from gspo.src.config import GSPOConfig
+from gspo.src.data import GSPOPromptDataset, gspo_collate_fn
 from gspo.src.batch import WeDLMBatch, build_wedlm_batch_from_response
 from gspo.src.model import wedlm_forward
 from gspo.src.loss import compute_block_scores, compute_gspo_loss
 from gspo.src.attention import check_backend_available, get_available_backend, get_attention_wrapper
-from gspo.src.data import GSPOPromptDataset, gspo_collate_fn
-from gspo.src.generator import BaseGenerator, MockGenerator, WeDLMGenerator
 
 logger = logging.getLogger(__name__)
 
 MASK_TOKEN_ID = 151665
 
+# Lazy import wandb
+_wandb = None
+
+
+def _init_wandb(config: GSPOConfig, accelerator: Accelerator):
+    """Initialize wandb if enabled (main process only)."""
+    if not config.use_wandb or not accelerator.is_main_process:
+        return None
+    global _wandb
+    try:
+        import wandb
+        _wandb = wandb
+    except ImportError:
+        logger.warning("wandb not installed, skipping wandb logging")
+        return None
+    if config.wandb_host:
+        os.environ["WANDB_BASE_URL"] = config.wandb_host
+    if config.wandb_key:
+        os.environ["WANDB_API_KEY"] = config.wandb_key
+    wandb.init(
+        project=config.wandb_project or "wedlm-gspo",
+        entity=config.wandb_team,
+        group=config.wandb_group,
+        config={k: v for k, v in config.__dict__.items() if not k.startswith("_")},
+    )
+    return wandb
+
+
+# ── Mock dataset for smoke testing ──
+
+class GSPOMockResponseDataset(Dataset):
+    """Mock dataset that returns pre-generated (response_ids, prompt_len, reward, prompt_idx).
+
+    This is used for smoke testing the training loop WITHOUT a real generator.
+    Each item is a dict with keys: response_ids, prompt_len, reward, prompt_idx.
+
+    In production, these values come from the WeDLM generator + reward model.
+    """
+
+    def __init__(
+        self,
+        prompts: List[List[int]],
+        gspo_group_size: int,
+        max_response_len: int = 512,
+        seed: int = 42,
+    ):
+        self.gspo_group_size = gspo_group_size
+        self.max_response_len = max_response_len
+        rng = torch.Generator().manual_seed(seed)
+        self.data: List[Dict] = []
+
+        for b, prompt_ids in enumerate(prompts):
+            prompt_list = list(prompt_ids)
+            for g in range(gspo_group_size):
+                # Mock response = prompt + random continuation
+                extra_len = int(torch.randint(16, max_response_len + 1, (1,), generator=rng).item())
+                continuation = torch.randint(0, 100000, (extra_len,), generator=rng).tolist()
+                response_ids = prompt_list + continuation
+                # Mock reward (random, with some correlation to length)
+                reward = float(len(continuation)) / max_response_len + torch.rand(1, generator=rng).item() * 0.5
+                self.data.append({
+                    "response_ids": response_ids,
+                    "prompt_len": len(prompt_list),
+                    "reward": reward,
+                    "prompt_idx": b,
+                })
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+
+def gspo_mock_collate_fn(batch: List[Dict]) -> Dict:
+    """Collate mock GSPO data — just return as list of dicts."""
+    return {"samples": batch}
+
+
+# ═══════════════════════════════════════════════════════════════
+# GSPO Trainer
+# ═══════════════════════════════════════════════════════════════
 
 class GSPOTrainer:
-    """GSPO on-policy trainer for block diffusion language models.
+    """Trainer for GSPO on-policy RL training with DeepSpeed support.
 
     Usage:
-        config = GSPOConfig.from_yaml("config.yaml")
-        trainer = GSPOTrainer(config)
+        config = GSPOConfig.from_yaml("configs/example.yaml")
+        accelerator = Accelerator(...)
+        trainer = GSPOTrainer(config, accelerator)
         trainer.train()
     """
 
-    def __init__(self, config: GSPOConfig):
+    def __init__(self, config: GSPOConfig, accelerator: Accelerator):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.global_step = 0
+        self.accelerator = accelerator
+        self.wandb = _init_wandb(config, accelerator)
+        self._setup()
+        self._prepare_training()
 
-        # ── Backend ──
-        if not check_backend_available(config.attention_backend):
-            config.attention_backend = get_available_backend()
-        logger.info(f"Attention backend: {config.attention_backend}")
+    # ── Setup ──
 
-        # ── Tokenizer ──
+    def _setup(self):
+        """Initialize model, tokenizer, attention wrapper, and dataset."""
+        if not check_backend_available(self.config.attention_backend):
+            self.config.attention_backend = get_available_backend()
+        logger.info(f"Attention backend: {self.config.attention_backend}")
+        logger.info(f"Training mode: {self.config.training_mode}")
+
         self.tokenizer = AutoTokenizer.from_pretrained(
-            config.model_path, trust_remote_code=config.trust_remote_code
+            self.config.model_path, trust_remote_code=self.config.trust_remote_code
         )
-        # Get im_end token ID for padding
-        _im_end = getattr(self.tokenizer, "im_end_id", None)
-        if _im_end is None:
-            _im_end = getattr(self.tokenizer, "eos_token_id", 151645)
-        self.tokenizer.pad_token_id = _im_end if _im_end is not None else self.tokenizer.eos_token_id
+        # Fallback pad token
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id or MASK_TOKEN_ID
 
-        # ── Model ──
-        self._init_model()
-
-        # ── Attention wrapper ──
-        head_dim = self.model.config.hidden_size // self.model.config.num_attention_heads
-        self.attn_wrapper = get_attention_wrapper(
-            config.attention_backend, head_dim, deterministic=False
-        )
-
-        # ── Generator ──
-        self._init_generator()
-
-        # ── Optimizer & scheduler ──
-        self._init_optimizer()
-
-        # ── Dataset ──
-        self._init_dataloader()
-
-    # ═══════════════════════════════════════════════════════════
-    # Initialization helpers
-    # ═══════════════════════════════════════════════════════════
-
-    def _init_model(self):
-        """Load the training model (HF format)."""
-        logger.info(f"Loading model from {self.config.model_path}")
         model_kwargs = {
             "trust_remote_code": self.config.trust_remote_code,
             "torch_dtype": torch.bfloat16 if self.config.bf16 else torch.float32,
             "attn_implementation": "eager",
         }
+        if self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3:
+            model_kwargs["low_cpu_mem_usage"] = True
+
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.model_path, **model_kwargs
         )
-        self.model.to(self.device)
-        self.model.train()
-        # Disable dropout for stable score estimation
-        for module in self.model.modules():
-            if isinstance(module, nn.Dropout):
-                module.eval()
 
-    def _init_generator(self):
-        """Create the generator (real WeDLM engine or mock).
-
-        The generator is created lazily — we defer engine init until the first
-        generate() call, because the training model already occupies GPU memory.
-        """
-        try:
-            self.generator: BaseGenerator = WeDLMGenerator(
-                model_path=self.config.model_path,
-                block_size=self.config.gspo_kvcache_block_size,
-                window_size=self.config.gspo_window_size,
-                gpu_memory_utilization=0.25,  # Conservative for co-existence
-                max_num_seqs=8,
-                max_model_len=self.config.max_seq_length,
-            )
-            logger.info("WeDLMGenerator interface created (lazy engine init)")
-        except Exception as e:
-            logger.warning(f"WeDLMGenerator init failed ({e}), falling back to MockGenerator")
-            self.generator = MockGenerator(fixed_length=64)
-
-    def _init_optimizer(self):
-        no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
-        optimizer_groups = [
-            {
-                "params": [p for n, p in self.model.named_parameters()
-                           if not any(nd in n for nd in no_decay) and p.requires_grad],
-                "weight_decay": self.config.weight_decay,
-            },
-            {
-                "params": [p for n, p in self.model.named_parameters()
-                           if any(nd in n for nd in no_decay) and p.requires_grad],
-                "weight_decay": 0.0,
-            },
-        ]
-        self.optimizer = torch.optim.AdamW(
-            optimizer_groups, lr=self.config.learning_rate
+        head_dim = self.model.config.hidden_size // self.model.config.num_attention_heads
+        self.attn_wrapper = get_attention_wrapper(
+            self.config.attention_backend, head_dim, deterministic=False,
         )
+        if hasattr(self.attn_wrapper, "to"):
+            self.attn_wrapper = self.attn_wrapper.to(self.accelerator.device)
 
-        # Estimate total steps for scheduler
-        steps_per_epoch = max(len(self.train_dataloader) if hasattr(self, 'train_dataloader') else 100, 1)
-        num_update_steps = math.ceil(steps_per_epoch / self.config.gradient_accumulation_steps)
-        self.num_training_steps = num_update_steps * self.config.num_train_epochs
-        num_warmup = int(self.num_training_steps * self.config.warmup_ratio)
-
-        self.lr_scheduler = get_scheduler(
-            self.config.lr_scheduler_type,
-            optimizer=self.optimizer,
-            num_warmup_steps=num_warmup,
-            num_training_steps=self.num_training_steps,
-        )
-
-        self.scaler = None  # bf16 does not need GradScaler (only fp16 does)
-
-    def _init_dataloader(self):
-        self.train_dataset = GSPOPromptDataset(
+        # Dataset: load prompts from JSONL
+        self.prompt_dataset = GSPOPromptDataset(
             data_path=self.config.train_data,
             tokenizer=self.tokenizer,
             max_prompt_length=self.config.max_seq_length,
         )
+        if len(self.prompt_dataset) == 0:
+            raise RuntimeError(f"No valid prompts found in {self.config.train_data}")
+
+        logger.info(f"Loaded {len(self.prompt_dataset)} prompts for GSPO training")
+
+        # Build mock response dataset (replaced by real generator in Step 4)
+        self.train_dataset = GSPOMockResponseDataset(
+            prompts=[self.prompt_dataset[i].tolist() for i in range(len(self.prompt_dataset))],
+            gspo_group_size=self.config.gspo_group_size,
+            max_response_len=min(self.config.gspo_max_new_tokens, 512),
+            seed=self.config.seed,
+        )
+        logger.info(
+            f"Built mock dataset with {len(self.train_dataset)} responses "
+            f"(B={len(self.prompt_dataset)}, G={self.config.gspo_group_size})"
+        )
+
+        # Distributed sampler
+        if self.accelerator.num_processes > 1:
+            self.train_sampler = DistributedSampler(
+                self.train_dataset,
+                num_replicas=self.accelerator.num_processes,
+                rank=self.accelerator.process_index,
+                shuffle=True,
+                seed=self.config.seed,
+            )
+            shuffle = False
+        else:
+            self.train_sampler = None
+            shuffle = True
+
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_size=self.config.per_device_train_batch_size,
-            shuffle=True,
-            collate_fn=gspo_collate_fn,
-            num_workers=0,
+            batch_size=self.config.per_device_train_batch_size * self.config.gspo_group_size,
+            sampler=self.train_sampler,
+            shuffle=shuffle,
+            collate_fn=gspo_mock_collate_fn,
+            num_workers=0,  # mock data is in-memory
+            pin_memory=False,
         )
-        logger.info(f"GSPO dataloader: {len(self.train_dataset)} prompts, "
-                     f"batch_size={self.config.per_device_train_batch_size}")
 
-    # ═══════════════════════════════════════════════════════════
-    # Memory management for single-GPU co-existence
-    # ═══════════════════════════════════════════════════════════
+    def _prepare_training(self):
+        """Prepare optimizer, scheduler, and Accelerate wrapper."""
+        steps_per_epoch = len(self.train_dataloader)
 
-    def _offload_training_model(self):
-        """Move training model & optimizer states to CPU.
+        num_update_steps_per_epoch = math.ceil(
+            steps_per_epoch / self.config.gradient_accumulation_steps
+        )
+        self.num_training_steps = num_update_steps_per_epoch * self.config.num_train_epochs
+        num_warmup_steps = int(self.num_training_steps * self.config.warmup_ratio)
 
-        Frees GPU memory for the WeDLM generator during Phase 1.
-        """
-        if not torch.cuda.is_available():
-            return
-        logger.debug("Offloading training model to CPU...")
-        self.model.to("cpu")
-        # Optimizer states follow the model parameters automatically
-        torch.cuda.empty_cache()
-        logger.debug("Training model offloaded; GPU memory freed.")
+        if self.accelerator.is_main_process:
+            logger.info(f"=== GSPO Training Configuration ===")
+            logger.info(f"GPUs: {self.accelerator.num_processes}")
+            logger.info(f"Responses per GPU per epoch: {steps_per_epoch}")
+            logger.info(f"Gradient accumulation steps: {self.config.gradient_accumulation_steps}")
+            logger.info(f"Update steps per epoch: {num_update_steps_per_epoch}")
+            logger.info(f"Total training steps: {self.num_training_steps}")
+            logger.info(f"Warmup steps: {num_warmup_steps}")
+            logger.info(f"Group size G: {self.config.gspo_group_size}")
+            logger.info(f"MC mask samples K: {self.config.gspo_num_mask_samples}")
 
-    def _load_training_model(self):
-        """Move training model back to GPU.
+        no_decay = ["bias", "LayerNorm.weight", "layer_norm.weight"]
+        optimizer_groups = [
+            {
+                "params": [
+                    p for n, p in self.model.named_parameters()
+                    if not any(nd in n for nd in no_decay) and p.requires_grad
+                ],
+                "weight_decay": self.config.weight_decay,
+            },
+            {
+                "params": [
+                    p for n, p in self.model.named_parameters()
+                    if any(nd in n for nd in no_decay) and p.requires_grad
+                ],
+                "weight_decay": 0.0,
+            },
+        ]
+        self.optimizer = torch.optim.AdamW(optimizer_groups, lr=self.config.learning_rate)
 
-        Called after generator is destroyed, before Phase 2 scoring.
-        """
-        if not torch.cuda.is_available():
-            return
-        logger.debug("Loading training model to GPU...")
-        self.model.to(self.device)
-        torch.cuda.empty_cache()
-        logger.debug("Training model on GPU; ready for scoring.")
+        self.lr_scheduler = get_scheduler(
+            self.config.lr_scheduler_type,
+            optimizer=self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=self.num_training_steps,
+        )
 
-    # ═══════════════════════════════════════════════════════════
-    # Reward function (plug-in point)
-    # ═══════════════════════════════════════════════════════════
+        self.model, self.optimizer, self.train_dataloader, self.lr_scheduler = (
+            self.accelerator.prepare(
+                self.model, self.optimizer, self.train_dataloader, self.lr_scheduler
+            )
+        )
 
-    @torch.no_grad()
-    def _compute_rewards(
-        self,
-        prompts: List[List[int]],
-        responses: List[List[int]],
-    ) -> List[float]:
-        """Compute reward for each (prompt, response) pair.
+        self.global_step = 0
 
-        Default implementation: simple length-based heuristic.
-        Override this method to plug in a real reward model.
+    # ── Forward helpers ──
 
-        Args:
-            prompts: Tokenized prompt IDs.
-            responses: Generated completion token IDs.
-
-        Returns:
-            List of scalar reward values.
-        """
-        # Simple heuristic: prefer medium-length responses (20-200 tokens)
-        rewards = []
-        for resp in responses:
-            L = len(resp)
-            if L < 5:
-                r = -1.0
-            elif L < 20:
-                r = 0.0
-            elif L <= 200:
-                r = 1.0
-            else:
-                r = max(0.0, 1.0 - 0.01 * (L - 200))
-            rewards.append(r)
-        return rewards
-
-    # ═══════════════════════════════════════════════════════════
-    # Score computation (with grad)
-    # ═══════════════════════════════════════════════════════════
-
-    def _score_response(
-        self,
-        response_ids: torch.Tensor,
-        prompt_len: int,
+    def _forward_wedlm_logits(
+        self, model: torch.nn.Module, batch: WeDLMBatch
     ) -> torch.Tensor:
-        """Compute block-level score S_θ(y|x) for a single response.
+        """Forward WeDLM model and return logits."""
+        try:
+            forward_model = self.accelerator.unwrap_model(model)
+        except Exception:
+            forward_model = model
+        return wedlm_forward(
+            forward_model, batch, self.attn_wrapper, self.config.attention_backend
+        )
 
-        K Monte Carlo masking samples are averaged to reduce variance.
+    # ── Train step ──
+
+    def train_step_gspo(self, batch: Dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Single GSPO training step.
 
         Args:
-            response_ids: [L] tensor = prompt_ids + completion_ids.
-            prompt_len: Number of prompt tokens (these are never masked).
+            batch: Dict with key "samples" → list of dicts, each having:
+                response_ids, prompt_len, reward, prompt_idx.
 
         Returns:
-            Scalar score tensor (retains grad).
+            loss: Scalar loss (for backward).
+            logs: Dict of monitoring metrics.
         """
+        device = self.accelerator.device
+        samples: List[Dict] = batch["samples"]
+        N = len(samples)
         K = max(int(self.config.gspo_num_mask_samples), 1)
-        score_sum = torch.tensor(0.0, device=self.device)
 
-        for _ in range(K):
-            batch = build_wedlm_batch_from_response(
-                response_ids=response_ids,
-                prompt_len=prompt_len,
-                block_size=self.config.block_size,
-                mask_token_id=MASK_TOKEN_ID,
-                backend=self.config.attention_backend,
-                mask_per_block=self.config.mask_per_block,
-                eps=self.config.mask_eps,
-            )
+        if N == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True), {"loss": torch.tensor(0.0, device=device)}
 
-            logits = wedlm_forward(
-                self.model, batch, self.attn_wrapper, self.config.attention_backend
-            )
+        all_scores: List[torch.Tensor] = []
+        all_rewards: List[float] = []
+        all_prompt_idx: List[int] = []
 
-            scores, _ = compute_block_scores(
-                logits=logits,
-                targets=batch.original_ids,
-                masked_indices=batch.masked_indices,
-                p_mask=batch.p_mask,
-                logical_positions=batch.logical_positions,
-                cum_seqlens=batch.cum_seqlens,
-                block_size=self.config.block_size,
-                weighting_scheme=self.config.loss_weighting_scheme,
-                block_reduce="mean",
-                seq_reduce="mean",
-                eps=self.config.mask_eps,
-            )
-            # scores is [1] for a single response
-            score_sum = score_sum + scores[0] / K
+        # Score each response with K MC masking samples
+        for sample in samples:
+            response_ids = torch.tensor(sample["response_ids"], device=device, dtype=torch.long)
+            prompt_len = sample["prompt_len"]
 
-        return score_sum
+            score_sum = torch.tensor(0.0, device=device)
+            for _ in range(K):
+                batch_k = build_wedlm_batch_from_response(
+                    response_ids=response_ids,
+                    prompt_len=prompt_len,
+                    block_size=self.config.block_size,
+                    mask_token_id=MASK_TOKEN_ID,
+                    backend=self.config.attention_backend,
+                    mask_per_block=self.config.mask_per_block,
+                    eps=self.config.mask_eps,
+                )
+                logits = self._forward_wedlm_logits(self.model, batch_k)
+                s, _ = compute_block_scores(
+                    logits=logits,
+                    targets=batch_k.original_ids,
+                    masked_indices=batch_k.masked_indices,
+                    p_mask=batch_k.p_mask,
+                    logical_positions=batch_k.logical_positions,
+                    cum_seqlens=batch_k.cum_seqlens,
+                    block_size=self.config.block_size,
+                    weighting_scheme=self.config.loss_weighting_scheme,
+                    block_reduce="mean",
+                    seq_reduce="mean",
+                    eps=self.config.mask_eps,
+                )
+                score_sum = score_sum + s[0] / K  # single-sequence score
 
-    # ═══════════════════════════════════════════════════════════
-    # Single training step
-    # ═══════════════════════════════════════════════════════════
-
-    def train_step(
-        self,
-        prompts_batch: List[List[int]],
-        prompt_texts: List[str],
-    ) -> Dict[str, float]:
-        """Execute one full GSPO training step.
-
-        Memory management on single GPU:
-          - Phase 1: offload training model to CPU, run generator on GPU
-          - Phase 2: destroy generator, load training model back, compute loss
-        """
-        G = self.config.gspo_group_size
-        B = len(prompts_batch)
-        device = self.device
-
-        # ═══════════════ Phase 1: Generation ═══════════════
-        # Offload training model to CPU to free GPU memory for the generator
-        self._offload_training_model()
-
-        all_prompts = []
-        all_prompt_indices = []
-        for b in range(B):
-            for g in range(G):
-                all_prompts.append(prompts_batch[b])
-                all_prompt_indices.append(b)
-
-        with torch.no_grad():
-            from wedlm.sampling_params import SamplingParams
-            sp = SamplingParams(
-                temperature=self.config.gspo_temperature,
-                max_tokens=self.config.gspo_max_new_tokens,
-                top_p=0.95,
-                top_k=50,
-                wedlm_entropy_threshold=self.config.gspo_entropy_threshold,
-                wedlm_pos_penalty_factor=self.config.gspo_pos_penalty_factor,
-            )
-            all_responses = self.generator.generate(all_prompts, sp)
-
-        # Compute rewards while generator is still alive
-        all_rewards = self._compute_rewards(all_prompts, all_responses)
-
-        # Destroy generator to free GPU memory for training
-        self.generator.release_memory()
-        import torch as _torch
-        _torch.cuda.empty_cache()
-
-        # ═══════════════ Phase 2: Score + Loss ═══════════════
-        # Load training model back to GPU
-        self._load_training_model()
-
-        N = len(all_responses)
-        all_scores = []
-        prompt_idx_t = torch.empty(N, dtype=torch.long, device=device)
-
-        for i in range(N):
-            prompt_ids = all_prompts[i]
-            response_ids_only = all_responses[i]
-            # Full sequence = prompt + completion
-            full_ids = prompt_ids + response_ids_only
-            full_t = torch.tensor(full_ids, dtype=torch.long, device=device)
-            prompt_len = len(prompt_ids)
-
-            score_i = self._score_response(full_t, prompt_len)
-            all_scores.append(score_i)
-            prompt_idx_t[i] = all_prompt_indices[i]
+            all_scores.append(score_sum)
+            all_rewards.append(sample["reward"])
+            all_prompt_idx.append(sample["prompt_idx"])
 
         scores_t = torch.stack(all_scores)
         rewards_t = torch.tensor(all_rewards, device=device, dtype=scores_t.dtype)
+        prompt_t = torch.tensor(all_prompt_idx, device=device, dtype=torch.long)
 
-        loss, logs = compute_gspo_loss(scores_t, rewards_t, prompt_idx_t)
+        loss, logs = compute_gspo_loss(scores_t, rewards_t, prompt_t)
+        return loss, logs
 
-        # ═══════════════ Phase 3: Backward ═══════════════
-        if loss.requires_grad:
-            loss.backward()
+    def train_step(self, batch: Dict) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Dispatch to GSPO train step."""
+        return self.train_step_gspo(batch)
 
-        # Convert tensor logs to float
-        log_dict = {k: float(v.detach().cpu()) if isinstance(v, torch.Tensor) else float(v)
-                    for k, v in logs.items()}
-        log_dict["loss"] = float(loss.detach().cpu())
-        log_dict["lr"] = self.lr_scheduler.get_last_lr()[0]
-
-        return log_dict
-
-    # ═══════════════════════════════════════════════════════════
-    # Weight sync (training model → generator)
-    # ═══════════════════════════════════════════════════════════
-
-    def _sync_weights_to_generator(self):
-        """Save training model to temp dir, reload into generator."""
-        import tempfile
-        sync_dir = tempfile.mkdtemp(prefix="gspo_sync_")
-        logger.info(f"Syncing weights → generator (step {self.global_step})")
-        self.model.save_pretrained(sync_dir)
-        self.tokenizer.save_pretrained(sync_dir)
-        self.generator.update_weights(sync_dir)
-        # Clean up temp dir is handled by generator.release_memory → engine.exit
-
-    # ═══════════════════════════════════════════════════════════
-    # Main training loop
-    # ═══════════════════════════════════════════════════════════
+    # ── Main training loop ──
 
     def train(self):
         """Main GSPO training loop."""
-        logger.info(f"Starting GSPO training: {self.num_training_steps} update steps")
+        logger.info(
+            f"Starting GSPO training: {len(self.train_dataloader)} batches/GPU, "
+            f"{self.num_training_steps} total update steps"
+        )
+
+        progress_bar = tqdm(
+            total=self.num_training_steps,
+            disable=not self.accelerator.is_local_main_process,
+        )
 
         for epoch in range(self.config.num_train_epochs):
-            logger.info(f"Epoch {epoch + 1}/{self.config.num_train_epochs}")
+            self.model.train()
 
-            for step, prompts_batch in enumerate(self.train_dataloader):
-                # prompts_batch is a list of token-id lists
-                prompt_texts = []  # can be filled from dataset if needed
+            if self.train_sampler is not None:
+                self.train_sampler.set_epoch(epoch)
 
-                # GSPO step
-                logs = self.train_step(prompts_batch, prompt_texts)
+            for batch in self.train_dataloader:
+                with self.accelerator.accumulate(self.model):
+                    loss, logs = self.train_step(batch)
+                    self.accelerator.backward(loss)
 
-                # Gradient accumulation
-                if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.config.max_grad_norm
-                    )
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(
+                            self.model.parameters(), self.config.max_grad_norm
+                        )
+
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
+
+                if self.accelerator.sync_gradients:
                     self.global_step += 1
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(
+                        loss=f"{logs.get('loss', torch.tensor(0.0)).detach().item():.4f}"
+                    )
 
-                    # Logging
                     if self.global_step % self.config.logging_steps == 0:
-                        log_str = f"Step {self.global_step}: "
-                        log_str += ", ".join(f"{k}={v:.4f}" for k, v in logs.items())
-                        logger.info(log_str)
-
-                    # Periodic weight sync
-                    if self.global_step % self.config.gspo_sync_every_n_steps == 0:
-                        self._sync_weights_to_generator()
-
-                    # Save checkpoint
+                        self._log_metrics(logs, epoch)
                     if self.global_step % self.config.save_steps == 0:
                         self._save_checkpoint()
 
-            logger.info(f"Epoch {epoch + 1} complete")
-
-        # Final save
+        progress_bar.close()
         self._save_checkpoint(final=True)
+        if self.wandb:
+            self.wandb.finish()
         logger.info("GSPO training complete!")
 
+    # ── Logging & Saving ──
+
+    def _log_metrics(self, logs: Dict, epoch: int):
+        if self.accelerator.is_main_process:
+            log_str = f"Epoch {epoch} Step {self.global_step}: "
+            log_str += ", ".join(
+                f"{k}={v.item():.4f}"
+                for k, v in logs.items()
+                if isinstance(v, torch.Tensor) and v.dim() == 0
+            )
+            logger.info(log_str)
+            if self.wandb:
+                self.wandb.log(
+                    {k: v.item() if hasattr(v, "item") else v for k, v in logs.items()},
+                    step=self.global_step,
+                )
+
     def _save_checkpoint(self, final: bool = False):
+        self.accelerator.wait_for_everyone()
         save_path = os.path.join(
             self.config.output_dir,
             "final" if final else f"checkpoint-{self.global_step}",
         )
-        os.makedirs(save_path, exist_ok=True)
-        self.model.save_pretrained(save_path)
-        self.tokenizer.save_pretrained(save_path)
-        logger.info(f"Saved checkpoint to {save_path}")
+        if self.accelerator.is_main_process:
+            os.makedirs(save_path, exist_ok=True)
+            self.accelerator.unwrap_model(self.model).save_pretrained(save_path)
+            self.tokenizer.save_pretrained(save_path)
+            logger.info(f"Saved checkpoint to {save_path}")

@@ -18,8 +18,7 @@ from gspo.src.masking import (
     build_2d_attention_mask,
     build_magi_plan,
 )
-from gspo.src.generator import BaseGenerator, MockGenerator, WeDLMGenerator
-from gspo.src.trainer import GSPOTrainer
+from gspo.src.trainer import GSPOTrainer, GSPOMockResponseDataset
 
 __all__ = [
     # Config
@@ -47,10 +46,7 @@ __all__ = [
     "reorder_block",
     "build_2d_attention_mask",
     "build_magi_plan",
-    # Generator
-    "BaseGenerator",
-    "MockGenerator",
-    "WeDLMGenerator",
     # Trainer
     "GSPOTrainer",
+    "GSPOMockResponseDataset",
 ]

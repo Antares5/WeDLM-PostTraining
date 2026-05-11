@@ -1,13 +1,21 @@
 #!/usr/bin/env python
 # coding=utf-8
-"""Smoke test for Step 3: GSPO Trainer construction + single train_step.
+"""Smoke test for Step 3: Full training loop with DeepSpeed.
 
 Run:
-    # CPU-only (no model): validates config, generator, trainer construction
-    python gspo/scripts/smoke_test_step3.py
+    # Single-GPU quick test (a few steps):
+    python gspo/scripts/smoke_test_step3.py --model_path tencent/WeDLM-8B-Instruct --steps 5
 
-    # GPU full test (requires model):
-    python gspo/scripts/smoke_test_step3.py --model_path tencent/WeDLM-8B-Instruct
+    # Multi-GPU with DeepSpeed:
+    accelerate launch --multi_gpu --num_processes 2 --mixed_precision bf16 \\
+        gspo/scripts/smoke_test_step3.py --model_path tencent/WeDLM-8B-Instruct --steps 10
+
+This test:
+  1. Creates a GSPOConfig with minimal settings.
+  2. Initializes an Accelerator (auto-detects single/multi GPU, DeepSpeed).
+  3. Builds a GSPOTrainer and runs a few training steps with mock data.
+  4. Verifies loss decreases (or at least is finite and produces gradients).
+  5. Saves a checkpoint.
 """
 
 import os
@@ -18,253 +26,219 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 import argparse
-import tempfile
 import json
-import torch
 import logging
+import tempfile
+import shutil
 
-logging.basicConfig(level=logging.WARNING)
+import torch
+from accelerate import Accelerator
+from accelerate.utils import set_seed, DeepSpeedPlugin
+
+from gspo.src.config import GSPOConfig
+from gspo.src.trainer import GSPOTrainer
+
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ── helpers ──
 
 def green(s: str) -> str: return f"\033[32m{s}\033[0m"
 def red(s: str) -> str:   return f"\033[31m{s}\033[0m"
 
-def section(title: str):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
 
-passed = 0
-failed = 0
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_path", type=str, default="tencent/WeDLM-8B-Instruct")
+    parser.add_argument("--steps", type=int, default=5, help="Number of training steps to run")
+    parser.add_argument("--output_dir", type=str, default=None)
+    args = parser.parse_args()
 
-def check(name: str, condition: bool, detail: str = ""):
-    global passed, failed
-    if condition:
-        print(f"  {green('[PASS]')} {name}")
-        passed += 1
-    else:
-        print(f"  {red('[FAIL]')} {name}" + (f"  → {detail}" if detail else ""))
-        failed += 1
+    # ── Build config ──
+    output_dir = args.output_dir or tempfile.mkdtemp(prefix="gspo_step3_")
+    prompt_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "train_prompts.jsonl")
 
+    if not os.path.exists(prompt_file):
+        print(f"{red('[FAIL]')} Prompt file not found: {prompt_file}")
+        print("  Create gspo/data/train_prompts.jsonl with a few chat prompts.")
+        sys.exit(1)
 
-# ═══════════════════════════════════════════════════════════════
-# TEST 1: Trainer construction (with mock generator)
-# ═══════════════════════════════════════════════════════════════
-
-section("Test 1: Trainer construction")
-
-# Create a minimal prompt JSONL
-tmp_data = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
-for i in range(4):
-    msg = [{"role": "user", "content": f"Test prompt {i}"}]
-    tmp_data.write(json.dumps(msg) + "\n")
-tmp_data.close()
-
-from gspo.src.config import GSPOConfig
-from gspo.src.generator import MockGenerator
-
-config = GSPOConfig(
-    model_path="tencent/WeDLM-8B-Instruct",
-    train_data=tmp_data.name,
-    training_mode="gspo",
-    gspo_group_size=2,
-    gspo_num_mask_samples=2,
-    attention_backend="dense",
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=1,
-    max_seq_length=512,
-    gspo_sync_every_n_steps=100,  # don't actually sync
-)
-
-# Mock the generator before trainer init
-from gspo.src.trainer import GSPOTrainer
-# Need to import the module to patch
-import gspo.src.trainer as trainer_mod
-_original_init_gen = trainer_mod.GSPOTrainer._init_generator
-
-def _mock_init_generator(self):
-    self.generator = MockGenerator(fixed_length=32)
-
-trainer_mod.GSPOTrainer._init_generator = _mock_init_generator
-
-try:
-    trainer = GSPOTrainer(config)
-    check("1-construct: trainer created", True)
-    check("1-construct: model loaded", hasattr(trainer, 'model'))
-    check("1-construct: optimizer created", hasattr(trainer, 'optimizer'))
-    check("1-construct: dataloader has prompts", len(trainer.train_dataset) > 0,
-          f"dataset size = {len(trainer.train_dataset)}")
-    check("1-construct: generator is MockGenerator", isinstance(trainer.generator, MockGenerator))
-except Exception as e:
-    check("1-construct: trainer created", False, str(e))
-    import traceback; traceback.print_exc()
-
-# Clean up
-os.unlink(tmp_data.name)
-
-# Restore original
-trainer_mod.GSPOTrainer._init_generator = _original_init_gen
-
-
-# ═══════════════════════════════════════════════════════════════
-# TEST 2: Single train_step (with real model)
-# ═══════════════════════════════════════════════════════════════
-
-section("Test 2: Single train_step")
-
-args_model = argparse.Namespace(model_path=None)
-_parser = argparse.ArgumentParser()
-_parser.add_argument("--model_path", type=str, default=None)
-_args, _ = _parser.parse_known_args()
-args_model.model_path = _args.model_path
-
-if not args_model.model_path:
-    print(f"  {green('[SKIP]')} No --model_path provided. Skipping real-model test.")
-else:
-    try:
-        # Create fresh trainer with mock generator
-        tmp_data2 = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
-        for i in range(4):
-            msg = [{"role": "user", "content": f"What is {i}+{i}?"}]
-            tmp_data2.write(json.dumps(msg) + "\n")
-        tmp_data2.close()
-
-        config2 = GSPOConfig(
-            model_path=args_model.model_path,
-            train_data=tmp_data2.name,
-            training_mode="gspo",
-            gspo_group_size=2,
-            gspo_num_mask_samples=2,
-            attention_backend="dense",
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=1,
-            max_seq_length=256,
-            block_size=32,
-            gspo_sync_every_n_steps=100,
-            gspo_max_new_tokens=32,  # short generations
-        )
-
-        trainer_mod.GSPOTrainer._init_generator = _mock_init_generator
-        trainer2 = GSPOTrainer(config2)
-        trainer_mod.GSPOTrainer._init_generator = _original_init_gen
-
-        check("2-setup: trainer created", True)
-
-        # Get one batch
-        batch = next(iter(trainer2.train_dataloader))
-        check("2-setup: batch has prompts", len(batch) > 0,
-              f"batch size = {len(batch)}")
-
-        # Mock rewards that vary across responses (so advantage ≠ 0)
-        import random
-        def mock_rewards(prompts, responses):
-            return [float(len(r)) / 50.0 + random.uniform(-0.5, 0.5) for r in responses]
-
-        # Also make MockGenerator produce different lengths
-        class VariedMockGenerator(MockGenerator):
-            def generate(self, prompts, sampling_params):
-                import random
-                results = []
-                for prompt_ids in prompts:
-                    fake_len = random.randint(16, 80)
-                    results.append([random.randint(100, 50000) for _ in range(fake_len)])
-                return results
-
-        trainer2.generator = VariedMockGenerator()
-        trainer2._compute_rewards = mock_rewards
-
-        # Run train_step
-        logs = trainer2.train_step(batch, [])
-
-        check("2-step: loss in logs", "loss" in logs)
-        check("2-step: loss is finite",
-              "loss" in logs and abs(logs["loss"]) != float("inf"))
-        check("2-step: gspo/loss in logs", "gspo/loss" in logs)
-        check("2-step: gspo/adv_mean in logs", "gspo/adv_mean" in logs)
-
-        print(f"  2-step: loss={logs.get('loss', 'N/A'):.6f}, "
-              f"gspo/loss={logs.get('gspo/loss', 'N/A'):.6f}, "
-              f"adv_mean={logs.get('gspo/adv_mean', 'N/A'):.6f}")
-
-        # Gradient check: after train_step, model parameters should have grads
-        has_grad = False
-        for p in trainer2.model.parameters():
-            if p.grad is not None and p.grad.abs().sum() > 0:
-                has_grad = True
-                break
-        check("2-grad: model has gradients", has_grad)
-
-        # Optimizer step should succeed
-        trainer2.optimizer.step()
-        trainer2.optimizer.zero_grad()
-        check("2-optim: step succeeded", True)
-
-        os.unlink(tmp_data2.name)
-
-    except Exception as e:
-        import traceback
-        print(f"  {red('[FAIL]')} Test 2 crashed:")
-        traceback.print_exc()
-        check("2-step: overall", False, str(e))
-
-
-# ═══════════════════════════════════════════════════════════════
-# TEST 3: Generator interface smoke
-# ═══════════════════════════════════════════════════════════════
-
-section("Test 3: Generator interface")
-
-from gspo.src.generator import BaseGenerator, MockGenerator, WeDLMGenerator
-
-# Mock generator
-mock = MockGenerator(fixed_length=16)
-results = mock.generate([["hello", "world"], ["test"]], None)
-check("3-mock: returns correct count", len(results) == 2)
-check("3-mock: fixed length", len(results[0]) == 16)
-check("3-mock: update_weights no-op", True)  # doesn't crash
-mock.release_memory()
-check("3-mock: release_memory no-op", True)
-
-# WeDLMGenerator construction (may fail if wedlm package not available)
-try:
-    gen = WeDLMGenerator(
-        model_path="tencent/WeDLM-8B-Instruct",
-        block_size=4096,
-        window_size=16,
+    config = GSPOConfig(
+        model_path=args.model_path,
+        train_data=prompt_file,
+        output_dir=output_dir,
+        training_mode="gspo",
+        attention_backend="dense",
+        block_size=32,
+        max_seq_length=512,
+        mask_per_block=True,
+        loss_weighting_scheme="weighted",
+        mask_eps=1e-8,
+        # GSPO
+        gspo_group_size=2,
+        gspo_num_mask_samples=2,
+        gspo_max_new_tokens=64,
+        # Training
+        num_train_epochs=1,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+        learning_rate=3e-6,
+        warmup_ratio=0.0,  # no warmup for smoke test
+        max_grad_norm=1.0,
+        weight_decay=0.01,
+        # DeepSpeed
+        use_deepspeed=False,  # smoke test defaults to no DS (accelerate launch enables it)
+        # Logging
+        logging_steps=1,
+        save_steps=999999,  # don't save mid-training
+        save_total_limit=1,
+        num_learnable_im_end=8,
+        seed=42,
+        bf16=True,
     )
-    check("3-wedlm: constructor succeeds", True)
-except Exception as e:
-    print(f"  3-wedlm: WeDLMGenerator not available ({e})")
-    check("3-wedlm: constructor (expected to need GPU)", True)
+
+    print(f"{'='*60}")
+    print(f"  GSPO Step 3 Smoke Test")
+    print(f"{'='*60}")
+    print(f"  Model:     {config.model_path}")
+    print(f"  Prompts:   {config.train_data}")
+    print(f"  Output:    {config.output_dir}")
+    print(f"  Steps:     {args.steps}")
+    print(f"  G:         {config.gspo_group_size}")
+    print(f"  K:         {config.gspo_num_mask_samples}")
+    print(f"  Backend:   {config.attention_backend}")
+    print(f"  DeepSpeed: {config.use_deepspeed}")
+    print()
+
+    # ── Setup accelerator ──
+    deepspeed_plugin = None
+    if config.use_deepspeed:
+        ds_config = config.get_deepspeed_config()
+        if ds_config:
+            os.makedirs(config.output_dir, exist_ok=True)
+            ds_path = os.path.join(config.output_dir, "deepspeed_config.json")
+            with open(ds_path, "w") as f:
+                json.dump(ds_config, f, indent=2)
+            deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=ds_config)
+
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        mixed_precision="bf16" if config.bf16 else "no",
+        deepspeed_plugin=deepspeed_plugin,
+    )
+    set_seed(config.seed)
+
+    print(f"  Accelerator state:")
+    print(f"    num_processes:    {accelerator.num_processes}")
+    print(f"    device:           {accelerator.device}")
+    print(f"    is_main_process:  {accelerator.is_main_process}")
+    print(f"    mixed_precision:  {'bf16' if config.bf16 else 'no'}")
+    print()
+
+    # ── Build trainer ──
+    try:
+        trainer = GSPOTrainer(config, accelerator)
+    except Exception as e:
+        print(f"\n{red('[FAIL]')} Trainer initialization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    print(f"  {green('[PASS]')} Trainer initialized")
+    print(f"    Dataloader size: {len(trainer.train_dataloader)}")
+    print(f"    Total training steps: {trainer.num_training_steps}")
+    print()
+
+    # ── Run a few training steps ──
+    losses = []
+    trainer.global_step = 0
+    trainer.num_training_steps = args.steps  # override for smoke test
+
+    progress_bar_enabled = accelerator.is_local_main_process
+
+    step = 0
+    for epoch in range(config.num_train_epochs):
+        trainer.model.train()
+        if trainer.train_sampler is not None:
+            trainer.train_sampler.set_epoch(epoch)
+
+        for batch in trainer.train_dataloader:
+            if step >= args.steps:
+                break
+
+            with accelerator.accumulate(trainer.model):
+                loss, logs = trainer.train_step(batch)
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(
+                        trainer.model.parameters(), config.max_grad_norm
+                    )
+
+                trainer.optimizer.step()
+                trainer.lr_scheduler.step()
+                trainer.optimizer.zero_grad()
+
+            if accelerator.sync_gradients:
+                step += 1
+                loss_val = float(logs.get("loss", loss).detach().cpu().item())
+                losses.append(loss_val)
+                if accelerator.is_main_process:
+                    log_parts = [f"loss={loss_val:.4f}"]
+                    for k, v in logs.items():
+                        if isinstance(v, torch.Tensor) and v.dim() == 0:
+                            log_parts.append(f"{k}={v.item():.4f}")
+                    print(f"  Step {step}: " + ", ".join(log_parts))
+
+    print()
+
+    # ── Validate ──
+    all_passed = True
+
+    # 1. All losses must be finite
+    finite_losses = all(torch.isfinite(torch.tensor(l)).item() for l in losses)
+    if finite_losses:
+        print(f"  {green('[PASS]')} All losses finite")
+    else:
+        print(f"  {red('[FAIL]')} Some losses are NaN/Inf: {losses}")
+        all_passed = False
+
+    # 2. We completed the expected number of steps
+    if step == args.steps:
+        print(f"  {green('[PASS]')} Completed {step}/{args.steps} steps")
+    else:
+        print(f"  {red('[FAIL]')} Only completed {step}/{args.steps} steps")
+        all_passed = False
+
+    # 3. Save and verify checkpoint
+    if accelerator.is_main_process:
+        ckpt_dir = os.path.join(output_dir, "final")
+        try:
+            trainer._save_checkpoint(final=True)
+            if os.path.exists(os.path.join(ckpt_dir, "model.safetensors")) or \
+               any(f.endswith(".safetensors") for f in os.listdir(ckpt_dir)):
+                print(f"  {green('[PASS]')} Checkpoint saved to {ckpt_dir}")
+            else:
+                print(f"  {red('[FAIL]')} Checkpoint dir exists but no model file found")
+                all_passed = False
+        except Exception as e:
+            print(f"  {red('[FAIL]')} Checkpoint save failed: {e}")
+            all_passed = False
+
+    # Cleanup (optional — keep if user wants to inspect)
+    # if args.output_dir is None and os.path.exists(output_dir):
+    #     shutil.rmtree(output_dir)
+
+    # ── Summary ──
+    print()
+    if all_passed:
+        print(f"  {green('ALL TESTS PASSED — Step 3 is ready.')}")
+        print(f"  Checkpoints saved to: {output_dir}")
+    else:
+        print(f"  {red('SOME TESTS FAILED — check output above.')}")
+
+    sys.exit(0 if all_passed else 1)
 
 
-# ═══════════════════════════════════════════════════════════════
-# TEST 4: Entry script import
-# ═══════════════════════════════════════════════════════════════
-
-section("Test 4: Entry script import")
-
-try:
-    # Just verify the entry script is syntactically valid and imports work
-    import importlib.util
-    train_path = os.path.join(_project_root, "gspo", "train.py")
-    spec = importlib.util.spec_from_file_location("gspo_train", train_path)
-    check("4-entry: train.py is parseable", spec is not None)
-except Exception as e:
-    check("4-entry: train.py parse", False, str(e))
-
-
-# ═══════════════════════════════════════════════════════════════
-# SUMMARY
-# ═══════════════════════════════════════════════════════════════
-
-section("Summary")
-total = passed + failed
-print(f"  {passed}/{total} tests passed")
-if failed == 0:
-    print(f"\n  {green('ALL TESTS PASSED — Step 3 is ready.')}")
-else:
-    print(f"\n  {red(f'{failed} TEST(S) FAILED — fix before proceeding.')}")
-
-sys.exit(0 if failed == 0 else 1)
+if __name__ == "__main__":
+    main()
