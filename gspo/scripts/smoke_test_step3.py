@@ -156,18 +156,26 @@ else:
         check("2-setup: batch has prompts", len(batch) > 0,
               f"batch size = {len(batch)}")
 
-        # Mock rewards to avoid calling a real RM
-        original_compute_rewards = trainer2._compute_rewards
-
+        # Mock rewards that vary across responses (so advantage ≠ 0)
+        import random
         def mock_rewards(prompts, responses):
-            return [float(len(r)) / 50.0 for r in responses]  # length-based mock
+            return [float(len(r)) / 50.0 + random.uniform(-0.5, 0.5) for r in responses]
 
+        # Also make MockGenerator produce different lengths
+        class VariedMockGenerator(MockGenerator):
+            def generate(self, prompts, sampling_params):
+                import random
+                results = []
+                for prompt_ids in prompts:
+                    fake_len = random.randint(16, 80)
+                    results.append([random.randint(100, 50000) for _ in range(fake_len)])
+                return results
+
+        trainer2.generator = VariedMockGenerator()
         trainer2._compute_rewards = mock_rewards
 
         # Run train_step
         logs = trainer2.train_step(batch, [])
-
-        trainer2._compute_rewards = original_compute_rewards
 
         check("2-step: loss in logs", "loss" in logs)
         check("2-step: loss is finite",
@@ -188,14 +196,7 @@ else:
         check("2-grad: model has gradients", has_grad)
 
         # Optimizer step should succeed
-        if trainer2.scaler is not None:
-            trainer2.scaler.unscale_(trainer2.optimizer)
-        torch.nn.utils.clip_grad_norm_(trainer2.model.parameters(), 1.0)
-        if trainer2.scaler is not None:
-            trainer2.scaler.step(trainer2.optimizer)
-            trainer2.scaler.update()
-        else:
-            trainer2.optimizer.step()
+        trainer2.optimizer.step()
         trainer2.optimizer.zero_grad()
         check("2-optim: step succeeded", True)
 

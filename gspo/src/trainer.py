@@ -147,7 +147,7 @@ class GSPOTrainer:
             num_training_steps=self.num_training_steps,
         )
 
-        self.scaler = torch.amp.GradScaler("cuda") if self.config.bf16 else None
+        self.scaler = None  # bf16 does not need GradScaler (only fp16 does)
 
     def _init_dataloader(self):
         self.train_dataset = GSPOPromptDataset(
