@@ -101,17 +101,21 @@ class GSPOTrainer:
                 module.eval()
 
     def _init_generator(self):
-        """Create the generator (real WeDLM engine or mock)."""
+        """Create the generator (real WeDLM engine or mock).
+
+        The generator is created lazily — we defer engine init until the first
+        generate() call, because the training model already occupies GPU memory.
+        """
         try:
             self.generator: BaseGenerator = WeDLMGenerator(
                 model_path=self.config.model_path,
                 block_size=self.config.gspo_kvcache_block_size,
                 window_size=self.config.gspo_window_size,
-                gpu_memory_utilization=0.3,
-                max_num_seqs=16,
+                gpu_memory_utilization=0.25,  # Conservative for co-existence
+                max_num_seqs=8,
                 max_model_len=self.config.max_seq_length,
             )
-            logger.info("WeDLMGenerator initialized (real engine)")
+            logger.info("WeDLMGenerator interface created (lazy engine init)")
         except Exception as e:
             logger.warning(f"WeDLMGenerator init failed ({e}), falling back to MockGenerator")
             self.generator = MockGenerator(fixed_length=64)
@@ -164,6 +168,35 @@ class GSPOTrainer:
         )
         logger.info(f"GSPO dataloader: {len(self.train_dataset)} prompts, "
                      f"batch_size={self.config.per_device_train_batch_size}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Memory management for single-GPU co-existence
+    # ═══════════════════════════════════════════════════════════
+
+    def _offload_training_model(self):
+        """Move training model & optimizer states to CPU.
+
+        Frees GPU memory for the WeDLM generator during Phase 1.
+        """
+        if not torch.cuda.is_available():
+            return
+        logger.debug("Offloading training model to CPU...")
+        self.model.to("cpu")
+        # Optimizer states follow the model parameters automatically
+        torch.cuda.empty_cache()
+        logger.debug("Training model offloaded; GPU memory freed.")
+
+    def _load_training_model(self):
+        """Move training model back to GPU.
+
+        Called after generator is destroyed, before Phase 2 scoring.
+        """
+        if not torch.cuda.is_available():
+            return
+        logger.debug("Loading training model to GPU...")
+        self.model.to(self.device)
+        torch.cuda.empty_cache()
+        logger.debug("Training model on GPU; ready for scoring.")
 
     # ═══════════════════════════════════════════════════════════
     # Reward function (plug-in point)
@@ -269,16 +302,18 @@ class GSPOTrainer:
     ) -> Dict[str, float]:
         """Execute one full GSPO training step.
 
-        Phase 1: Generate G responses per prompt (no grad).
-        Phase 2: Compute rewards, block scores, REINFORCE loss (with grad).
-        Phase 3: Backward + optimizer step.
+        Memory management on single GPU:
+          - Phase 1: offload training model to CPU, run generator on GPU
+          - Phase 2: destroy generator, load training model back, compute loss
         """
         G = self.config.gspo_group_size
         B = len(prompts_batch)
         device = self.device
 
         # ═══════════════ Phase 1: Generation ═══════════════
-        # Expand each prompt G times
+        # Offload training model to CPU to free GPU memory for the generator
+        self._offload_training_model()
+
         all_prompts = []
         all_prompt_indices = []
         for b in range(B):
@@ -298,13 +333,18 @@ class GSPOTrainer:
             )
             all_responses = self.generator.generate(all_prompts, sp)
 
-        # Release generator memory before heavy training computation
-        self.generator.release_memory()
-
-        # Compute rewards
+        # Compute rewards while generator is still alive
         all_rewards = self._compute_rewards(all_prompts, all_responses)
 
+        # Destroy generator to free GPU memory for training
+        self.generator.release_memory()
+        import torch as _torch
+        _torch.cuda.empty_cache()
+
         # ═══════════════ Phase 2: Score + Loss ═══════════════
+        # Load training model back to GPU
+        self._load_training_model()
+
         N = len(all_responses)
         all_scores = []
         prompt_idx_t = torch.empty(N, dtype=torch.long, device=device)
@@ -327,11 +367,8 @@ class GSPOTrainer:
         loss, logs = compute_gspo_loss(scores_t, rewards_t, prompt_idx_t)
 
         # ═══════════════ Phase 3: Backward ═══════════════
-        if self.scaler is not None:
-            self.scaler.scale(loss).backward()
-        else:
-            if loss.requires_grad:
-                loss.backward()
+        if loss.requires_grad:
+            loss.backward()
 
         # Convert tensor logs to float
         log_dict = {k: float(v.detach().cpu()) if isinstance(v, torch.Tensor) else float(v)
@@ -375,16 +412,10 @@ class GSPOTrainer:
 
                 # Gradient accumulation
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                    if self.scaler is not None:
-                        self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.config.max_grad_norm
                     )
-                    if self.scaler is not None:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        self.optimizer.step()
+                    self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
                     self.global_step += 1
