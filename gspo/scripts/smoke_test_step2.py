@@ -377,8 +377,8 @@ if args.model_path:
                 model, test_batch, wrapper, backend
             )
         check("6-real: logits shape correct",
-              logits_real.dim() == 2 and logits_real.size(1) == tokenizer.vocab_size,
-              f"shape = {logits_real.shape}")
+              logits_real.dim() == 2 and logits_real.size(1) == model.config.vocab_size,
+              f"shape = {logits_real.shape}, model vocab = {model.config.vocab_size}")
         check("6-real: logits finite", torch.all(torch.isfinite(logits_real)).item())
 
         scores_real, _ = compute_block_scores(
