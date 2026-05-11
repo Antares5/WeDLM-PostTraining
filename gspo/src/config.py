@@ -49,7 +49,7 @@ class GSPOConfig:
     block_size: int = 32
     mask_per_block: bool = True
     loss_weighting_scheme: str = "weighted"  # "weighted" (1/γ) or "uniform"
-    mask_eps: float = 1e-8
+    mask_eps: float = 1e-3
     num_learnable_im_end: int = 8
 
     # ── AR loss ──

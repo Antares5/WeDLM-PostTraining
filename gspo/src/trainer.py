@@ -97,7 +97,7 @@ class GSPOMockResponseDataset(Dataset):
             group_samples: List[Dict] = []
             for g in range(gspo_group_size):
                 extra_len = int(torch.randint(16, max_response_len + 1, (1,), generator=rng).item())
-                continuation = torch.randint(0, 100000, (extra_len,), generator=rng).tolist()
+                continuation = torch.randint(0, 50000, (extra_len,), generator=rng).tolist()
                 response_ids = prompt_list + continuation
                 reward = float(len(continuation)) / max_response_len + torch.rand(1, generator=rng).item() * 0.5
                 group_samples.append({
@@ -355,6 +355,9 @@ class GSPOTrainer:
                 )
                 score_sum = score_sum + s[0] / K  # single-sequence score
 
+            # Guard against NaN scores (can occur with extreme masking ratios)
+            if not torch.isfinite(score_sum):
+                score_sum = torch.tensor(0.0, device=device, requires_grad=True)
             all_scores.append(score_sum)
             all_rewards.append(sample["reward"])
             all_prompt_idx.append(sample["prompt_idx"])

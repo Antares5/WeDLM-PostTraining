@@ -78,7 +78,7 @@ def main():
         max_seq_length=512,
         mask_per_block=True,
         loss_weighting_scheme="weighted",
-        mask_eps=1e-8,
+        mask_eps=1e-3,
         # GSPO
         gspo_group_size=2,
         gspo_num_mask_samples=2,

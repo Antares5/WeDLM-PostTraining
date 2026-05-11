@@ -53,12 +53,20 @@ def compute_block_scores(
 
     safe_targets = targets.clone().long()
     safe_targets[safe_targets < 0] = 0
+    # Clamp targets to valid vocab range to prevent cross_entropy NaN
+    V = logits.size(-1)
+    safe_targets = safe_targets.clamp(0, V - 1)
     token_nll = F.cross_entropy(logits, safe_targets, reduction="none")
+    # Guard against NaN/Inf from cross_entropy (can happen with extreme logits)
+    token_nll = torch.nan_to_num(token_nll, nan=0.0, posinf=1e4, neginf=-1e4)
     token_logps = -token_nll.to(dtype)
 
     weights = torch.zeros_like(token_logps, dtype=dtype)
     if weighting_scheme == "weighted":
-        masked_weights = 1.0 / (p_mask[masked_indices].to(dtype) + eps)
+        # Clamp weights to avoid overflow (1/γ can be huge when γ≈0)
+        max_weight = 1.0 / eps  # e.g. 1000 when eps=0.001
+        raw_weights = 1.0 / (p_mask[masked_indices].to(dtype) + eps)
+        masked_weights = torch.clamp(raw_weights, max=max_weight)
     else:
         num_masked = int(masked_indices.sum().item())
         masked_weights = torch.ones((num_masked,), device=device, dtype=dtype)
@@ -189,8 +197,9 @@ def compute_gspo_loss(
     device = scores.device
     dtype = scores.dtype
 
-    # Cast rewards to match scores dtype
+    # Cast rewards to match scores dtype, guard against NaN
     rewards = rewards.to(dtype=dtype)
+    scores = torch.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
 
     total_loss = torch.tensor(0.0, device=device, dtype=dtype)
     all_advantages: list[torch.Tensor] = []
