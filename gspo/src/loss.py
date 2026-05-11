@@ -202,10 +202,11 @@ def compute_gspo_loss(
         group_size = mask.sum().item()
 
         if group_size < 2:
-            # Edge case: single response per prompt — skip group normalization,
-            # use reward itself as a scalar signal (no baseline subtraction).
-            # This is suboptimal but keeps training from crashing.
-            advantage = group_rewards - group_rewards  # zero advantage → no update
+            # Single response per prompt — use raw reward as advantage signal.
+            # No group normalization, but still produces a valid gradient.
+            advantage = group_rewards
+            group_loss = -(advantage.detach() * group_scores).mean()
+            total_loss = total_loss + group_loss
             all_advantages.append(advantage)
             continue
 

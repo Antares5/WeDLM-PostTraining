@@ -59,9 +59,14 @@ def main():
     prompt_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "train_prompts.jsonl")
 
     if not os.path.exists(prompt_file):
-        print(f"{red('[FAIL]')} Prompt file not found: {prompt_file}")
-        print("  Create gspo/data/train_prompts.jsonl with a few chat prompts.")
-        sys.exit(1)
+        # Auto-create a minimal prompt file so the smoke test is self-contained
+        os.makedirs(os.path.dirname(prompt_file), exist_ok=True)
+        with open(prompt_file, "w") as f:
+            f.write('[{"role": "user", "content": "What is 2+2?"}]\n')
+            f.write('[{"role": "user", "content": "Write a haiku about AI."}]\n')
+            f.write('[{"role": "user", "content": "Explain block diffusion models briefly."}]\n')
+            f.write('[{"role": "user", "content": "What is the capital of France?"}]\n')
+        print(f"  Auto-created prompt file: {prompt_file}")
 
     config = GSPOConfig(
         model_path=args.model_path,

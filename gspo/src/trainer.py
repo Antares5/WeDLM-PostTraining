@@ -68,12 +68,14 @@ def _init_wandb(config: GSPOConfig, accelerator: Accelerator):
 # ── Mock dataset for smoke testing ──
 
 class GSPOMockResponseDataset(Dataset):
-    """Mock dataset that returns pre-generated (response_ids, prompt_len, reward, prompt_idx).
+    """Mock dataset that returns pre-grouped responses per prompt.
 
-    This is used for smoke testing the training loop WITHOUT a real generator.
-    Each item is a dict with keys: response_ids, prompt_len, reward, prompt_idx.
+    Each __getitem__ returns a list of G dicts for ONE prompt, so the
+    DataLoader naturally batches complete groups (all G responses for
+    one prompt). This is essential because compute_gspo_loss needs
+    group_size >= 2 within each batch entry to compute advantages.
 
-    In production, these values come from the WeDLM generator + reward model.
+    In production, each group comes from the WeDLM generator + reward model.
     """
 
     def __init__(
@@ -85,35 +87,43 @@ class GSPOMockResponseDataset(Dataset):
     ):
         self.gspo_group_size = gspo_group_size
         self.max_response_len = max_response_len
+        self.num_prompts = len(prompts)
         rng = torch.Generator().manual_seed(seed)
-        self.data: List[Dict] = []
 
+        # Pre-build one group per prompt
+        self.groups: List[List[Dict]] = []
         for b, prompt_ids in enumerate(prompts):
             prompt_list = list(prompt_ids)
+            group_samples: List[Dict] = []
             for g in range(gspo_group_size):
-                # Mock response = prompt + random continuation
                 extra_len = int(torch.randint(16, max_response_len + 1, (1,), generator=rng).item())
                 continuation = torch.randint(0, 100000, (extra_len,), generator=rng).tolist()
                 response_ids = prompt_list + continuation
-                # Mock reward (random, with some correlation to length)
                 reward = float(len(continuation)) / max_response_len + torch.rand(1, generator=rng).item() * 0.5
-                self.data.append({
+                group_samples.append({
                     "response_ids": response_ids,
                     "prompt_len": len(prompt_list),
                     "reward": reward,
                     "prompt_idx": b,
                 })
+            self.groups.append(group_samples)
 
     def __len__(self):
-        return len(self.data)
+        return self.num_prompts
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        """Return all G responses for the idx-th prompt as a list."""
+        return self.groups[idx]
 
 
-def gspo_mock_collate_fn(batch: List[Dict]) -> Dict:
-    """Collate mock GSPO data — just return as list of dicts."""
-    return {"samples": batch}
+def gspo_mock_collate_fn(batch: List[List[Dict]]) -> Dict:
+    """Collate: batch is a list of groups, each with G samples.
+    Flatten into a single list of samples for the train step.
+    """
+    flat = []
+    for group in batch:
+        flat.extend(group)
+    return {"samples": flat}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -211,11 +221,11 @@ class GSPOTrainer:
 
         self.train_dataloader = DataLoader(
             self.train_dataset,
-            batch_size=self.config.per_device_train_batch_size * self.config.gspo_group_size,
+            batch_size=self.config.per_device_train_batch_size,  # prompts per batch
             sampler=self.train_sampler,
             shuffle=shuffle,
             collate_fn=gspo_mock_collate_fn,
-            num_workers=0,  # mock data is in-memory
+            num_workers=0,
             pin_memory=False,
         )
 
