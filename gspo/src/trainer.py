@@ -30,6 +30,14 @@ MASK_TOKEN_ID = 151665
 _wandb = None
 
 
+class _NoOpContext:
+    """A trivial context manager (no-op) used when zero.Init is not needed."""
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass
+
+
 def _init_wandb(config: GSPOTrainingConfig, accelerator: Accelerator):
     """Initialize wandb if enabled (main process only)."""
     if not config.use_wandb or not accelerator.is_main_process:
@@ -89,18 +97,24 @@ class GSPOTrainer:
         }
         if self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3:
             model_kwargs["low_cpu_mem_usage"] = True
+            import deepspeed
+            self._ds_zero3_ctx = deepspeed.zero.Init()
+        else:
+            self._ds_zero3_ctx = None
 
         # Policy model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.model_path, **model_kwargs
-        )
+        with (self._ds_zero3_ctx or _NoOpContext()):
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_path, **model_kwargs
+            )
 
         # Reference model
         ref_model_path = self.config.gspo_ref_model_path or self.config.model_path
         logger.info(f"Loading reference model from {ref_model_path}")
-        self.ref_model = AutoModelForCausalLM.from_pretrained(
-            ref_model_path, **model_kwargs
-        )
+        with (self._ds_zero3_ctx or _NoOpContext()):
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                ref_model_path, **model_kwargs
+            )
         for param in self.ref_model.parameters():
             param.requires_grad = False
         self.ref_model.eval()

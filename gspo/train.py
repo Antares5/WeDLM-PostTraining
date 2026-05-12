@@ -174,7 +174,10 @@ def main():
             ds_path = os.path.join(config.output_dir, "deepspeed_config.json")
             with open(ds_path, "w") as f:
                 json.dump(ds_config, f, indent=2)
-            deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=ds_config)
+            deepspeed_plugin = DeepSpeedPlugin(
+                hf_ds_config=ds_config,
+                zero3_init_flag=(config.deepspeed_zero_stage == 3),
+            )
 
     # Initialize accelerator
     accelerator = Accelerator(
