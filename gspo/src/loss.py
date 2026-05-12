@@ -323,7 +323,7 @@ def compute_gspo_coefficients(
     device = policy_scores.device
 
     if K < 2:
-        return torch.zeros(K, device=device)
+        return torch.zeros(K, device=device, dtype=policy_scores.dtype)
 
     pi_diff = policy_scores - reference_scores  # [K]
 
@@ -332,7 +332,7 @@ def compute_gspo_coefficients(
     others_mask[best_idx] = False
 
     if others_mask.sum() == 0:
-        return torch.zeros(K, device=device)
+        return torch.zeros(K, device=device, dtype=pi_diff.dtype)
 
     best = pi_diff[best_idx]
     others = pi_diff[others_mask]  # [K-1]
@@ -342,19 +342,22 @@ def compute_gspo_coefficients(
         torch.tensor(others.numel(), dtype=others.dtype, device=device)
     )
 
-    logits = beta * (best - others_logmeanexp)
+    # Use input dtype consistently to avoid float32 promotion from Python scalars
+    beta_t = torch.tensor(beta, dtype=pi_diff.dtype, device=device)
+    logits = beta_t * (best - others_logmeanexp)
     sigmoid_z = torch.sigmoid(logits)
 
     # dL/d(best) = -beta * (1 - sigmoid(logits))
-    coeff_best = -beta * (1.0 - sigmoid_z)
+    one = torch.tensor(1.0, dtype=pi_diff.dtype, device=device)
+    coeff_best = -beta_t * (one - sigmoid_z)
 
     # dL/d(other_j) = beta * (1 - sigmoid(logits)) * softmax(other_j) / (K-1)
     # where softmax is over the others
     others_softmax = F.softmax(others, dim=0)
-    coeff_others = beta * (1.0 - sigmoid_z) * others_softmax
+    coeff_others = beta_t * (one - sigmoid_z) * others_softmax
 
-    # Build full coefficient tensor
-    coefficients = torch.zeros(K, device=device)
+    # Build full coefficient tensor (match input dtype)
+    coefficients = torch.zeros(K, device=device, dtype=pi_diff.dtype)
     coefficients[best_idx] = coeff_best
     coefficients[others_mask] = coeff_others
 

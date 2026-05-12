@@ -236,6 +236,7 @@ class GSPOTrainer:
             tokenizer=self.tokenizer,
             generation_config=generation_config,
             device=self.accelerator.device,
+            model_path=self.config.model_path,
         )
 
         self.global_step = 0

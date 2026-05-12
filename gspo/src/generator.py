@@ -23,6 +23,7 @@ class WeDLMGenerator:
         tokenizer: Any,
         generation_config: Dict[str, Any],
         device: torch.device,
+        model_path: str = None,
     ):
         """
         Args:
@@ -31,11 +32,13 @@ class WeDLMGenerator:
             generation_config: Dict with max_new_tokens, temperature, top_p, top_k,
                                wedlm_entropy_threshold, wedlm_pos_penalty_factor.
             device: Target device.
+            model_path: Path to model directory (required for LLMEngine initialization).
         """
         self.model = model
         self.tokenizer = tokenizer
         self.gen_config = generation_config
         self.device = device
+        self.model_path = model_path
 
     def _build_sampling_params(self, seed: Optional[int] = None) -> SamplingParams:
         """Build SamplingParams from generation config."""
@@ -76,7 +79,7 @@ class WeDLMGenerator:
             raise ValueError("Empty prompt after tokenization")
 
         sampling_params = self._build_sampling_params(seed)
-        engine = LLMEngine(self.model)
+        engine = LLMEngine(self.model_path or self.model)
 
         try:
             results = engine.generate(
