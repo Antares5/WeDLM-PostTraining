@@ -1,13 +1,28 @@
 # coding=utf-8
 """On-policy generation engine wrapping wedlm.engine.LLMEngine."""
 
+import os
 import logging
 from typing import List, Dict, Optional, Any
 import torch
-from wedlm.engine.llm_engine import LLMEngine
-from wedlm.sampling_params import SamplingParams
+import torch.distributed as dist
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Safeguard 1: disable torch.compile to avoid triton version incompatibility
+# (ImportError: cannot import name 'triton_key' from 'triton.compiler.compiler')
+# Must be set BEFORE importing wedlm modules that use @torch.compile.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+try:
+    import torch._dynamo as dynamo
+    dynamo.config.disable = True
+except Exception:
+    pass
+
+from wedlm.engine.llm_engine import LLMEngine
+from wedlm.sampling_params import SamplingParams
 
 
 class WeDLMGenerator:
@@ -79,16 +94,49 @@ class WeDLMGenerator:
             raise ValueError("Empty prompt after tokenization")
 
         sampling_params = self._build_sampling_params(seed)
-        engine = LLMEngine(self.model_path or self.model)
+
+        # ------------------------------------------------------------------
+        # Safeguard 2: LLMEngine → ModelRunner._init_distributed() calls
+        # dist.init_process_group() unconditionally.  When running under
+        # accelerate, the process group is already initialized → double init
+        # error.  We temporarily replace init_process_group with a no-op.
+        # ------------------------------------------------------------------
+        _orig_init_pg = dist.init_process_group
+        if dist.is_initialized():
+            dist.init_process_group = lambda *a, **kw: None
+
+        # ------------------------------------------------------------------
+        # Safeguard 3: ModelRunner._init_model() calls
+        # torch.set_default_device("cuda") and restores it on success, but
+        # if an exception occurs (e.g. triton), the restore is skipped,
+        # leaking "cuda" as the global default device for all future tensor
+        # creation (→ pin_memory crash).  We snapshot and forcibly restore.
+        # ------------------------------------------------------------------
+        _default_device = torch.get_default_device() if hasattr(torch, "get_default_device") else torch.device("cpu")
+        _default_dtype = torch.get_default_dtype()
 
         try:
-            results = engine.generate(
-                prompts=[prompt_text],
-                sampling_params=sampling_params,
-                use_tqdm=False,
-            )
+            engine = LLMEngine(self.model_path or self.model)
+            try:
+                results = engine.generate(
+                    prompts=[prompt_text],
+                    sampling_params=sampling_params,
+                    use_tqdm=False,
+                )
+            finally:
+                engine.exit()
         finally:
-            engine.exit()
+            # Restore distributed init (even if we replaced it)
+            dist.init_process_group = _orig_init_pg
+            # Force-restore default device/dtype in case LLMEngine leaked "cuda"
+            try:
+                torch.set_default_device(_default_device)
+            except Exception:
+                pass
+            try:
+                torch.set_default_dtype(_default_dtype)
+            except Exception:
+                pass
 
         if not results:
             raise RuntimeError("Generation returned no results")

@@ -152,7 +152,8 @@ class GSPOTrainer:
             shuffle=shuffle,
             collate_fn=collate_fn,
             num_workers=0,  # avoid issues with LLMEngine multiprocessing
-            pin_memory=True,
+            pin_memory=False,  # accelerate handles device placement; True risks
+                               # CUDA-tensor pin crash if default device leaks
         )
 
         # Generator (initialized after model is on device, during _prepare_training)
