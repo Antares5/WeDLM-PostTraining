@@ -1,0 +1,94 @@
+# GSPO On-Policy Training Configuration
+# =========================================
+
+# ========== Model ==========
+model_path: "tencent/WeDLM-8B-Base"
+trust_remote_code: true
+
+# ========== Data ==========
+gspo_prompt_data: "data/prompts.jsonl"
+gspo_prompt_format: "messages"          # "messages" or "deepmath"
+max_seq_length: 2048
+
+# ========== GSPO Core ==========
+gspo_num_samples: 4                     # K: number of responses per prompt
+gspo_beta: 0.1                          # GSPO temperature coefficient
+gspo_block_reduce: "mean"               # block reduction: "mean" or "sum"
+gspo_seq_reduce: "mean"                 # sequence reduction: "mean" or "sum"
+gspo_num_mask_samples: 1                # MC mask samples for scoring
+gspo_length_norm: true                  # enable length normalization
+gspo_ref_model_path: null               # null = use model_path for ref
+
+# ========== Reward (Phase 1: rule-based math) ==========
+gspo_reward_type: "math_verify"         # "math_verify" (Phase 1) / "model" (Phase 3)
+# gspo_reward_model_path: null          # only for reward_type="model" (Phase 3)
+
+# ========== Generation ==========
+gen_max_new_tokens: 512
+gen_temperature: 1.0
+gen_top_p: 1.0
+gen_top_k: 0
+gen_wedlm_entropy_threshold: 0.4
+gen_wedlm_pos_penalty_factor: 0.02
+
+# ========== WeDLM Structure ==========
+block_size: 32
+mask_per_block: true
+loss_weighting_scheme: "weighted"
+mask_eps: 1.0e-8
+num_learnable_im_end: 0
+
+# ========== AR Loss (optional, typically off for GSPO) ==========
+enable_ar_loss: false
+ar_loss_weight: 1.0
+
+# ========== Attention ==========
+attention_backend: "dense"              # "magi" or "dense"
+
+# ========== Training ==========
+output_dir: "outputs/gspo"
+num_train_epochs: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-6
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.1
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+# ========== Cache ==========
+rebuild_cache: false
+
+# ========== DeepSpeed ==========
+use_deepspeed: false
+deepspeed_zero_stage: 2
+deepspeed_offload_optimizer: false
+deepspeed_offload_param: false
+deepspeed_offload_nvme: false
+deepspeed_nvme_path: "/tmp/deepspeed_offload"
+deepspeed_pin_memory: true
+deepspeed_overlap_comm: true
+deepspeed_contiguous_gradients: true
+deepspeed_reduce_bucket_size: 50000000
+deepspeed_stage3_prefetch_bucket_size: 50000000
+deepspeed_stage3_param_persistence_threshold: 100000
+deepspeed_stage3_max_live_parameters: 1000000000
+deepspeed_stage3_max_reuse_distance: 1000000000
+# deepspeed_config_file: null
+
+# ========== Logging & Saving ==========
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+
+# ========== Device & Seed ==========
+bf16: true
+seed: 42
+
+# ========== WandB (optional) ==========
+use_wandb: false
+# wandb_project: "wedlm-gspo"
+# wandb_team: null
+# wandb_group: null
+# wandb_host: null
+# wandb_key: null
