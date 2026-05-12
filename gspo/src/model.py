@@ -62,12 +62,17 @@ def wedlm_forward(
     base_model = model.model if hasattr(model, "model") else model
     lm_head = model.lm_head
 
-    # Use F.embedding directly to bypass padding_idx size check that fails
-    # under DeepSpeed ZeRO-3 where embedding weight is partitioned and
-    # weight.size(0) returns shard-local size instead of global vocab_size.
-    hidden_states = F.embedding(
-        batch.packed_input_ids, base_model.embed_tokens.weight
-    )
+    # Use nn.Embedding.forward() so DeepSpeed ZeRO-3 can intercept and
+    # gather partitioned parameters.  Temporarily disable padding_idx to
+    # bypass the size check that fails under ZeRO-3 where weight.size(0)
+    # returns shard-local size instead of global vocab_size.
+    embed_tokens = base_model.embed_tokens
+    padding_idx = embed_tokens.padding_idx
+    try:
+        embed_tokens.padding_idx = None
+        hidden_states = embed_tokens(batch.packed_input_ids)
+    finally:
+        embed_tokens.padding_idx = padding_idx
 
     position_ids = batch.logical_positions.unsqueeze(0)
     cos, sin = base_model.rotary_emb(hidden_states.unsqueeze(0), position_ids)
