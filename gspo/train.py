@@ -89,6 +89,15 @@ def parse_args():
     )
     # Training
     parser.add_argument(
+        "--max_seq_length", type=int, default=None, help="Override max sequence length"
+    )
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=None,
+        help="Override per-device train batch size",
+    )
+    parser.add_argument(
         "--output_dir", type=str, default=None, help="Override output directory"
     )
     parser.add_argument(
@@ -144,6 +153,8 @@ def main():
         "gen_temperature": args.gen_temperature,
         "gen_top_p": args.gen_top_p,
         "gen_top_k": args.gen_top_k,
+        "max_seq_length": args.max_seq_length,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
         "output_dir": args.output_dir,
         "attention_backend": args.attention_backend,
         "loss_weighting_scheme": args.loss_weighting_scheme,
