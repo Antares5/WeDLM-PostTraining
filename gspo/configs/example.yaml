@@ -2,7 +2,7 @@
 # =========================================
 
 # ========== Model ==========
-model_path: "tencent/WeDLM-8B-Base"
+model_path: "tencent/WeDLM-8B-Instruct"
 trust_remote_code: true
 
 # ========== Data ==========
@@ -65,7 +65,7 @@ deepspeed_zero_stage: 3
 deepspeed_offload_optimizer: false
 deepspeed_offload_param: false
 deepspeed_offload_nvme: false
-deepspeed_nvme_path: "/tmp/deepspeed_offload"
+deepspeed_nvme_path: "/dfs/data/tmp/deepspeed_offload"
 deepspeed_pin_memory: true
 deepspeed_overlap_comm: true
 deepspeed_contiguous_gradients: true

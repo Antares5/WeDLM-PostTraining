@@ -3,6 +3,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from src.batch import WeDLMBatch
 
 
@@ -60,13 +61,18 @@ def wedlm_forward(
     """Full forward pass with WeDLM attention pattern."""
     base_model = model.model if hasattr(model, "model") else model
     lm_head = model.lm_head
-    
-    hidden_states = base_model.embed_tokens(batch.packed_input_ids)
-    
+
+    # Use F.embedding directly to bypass padding_idx size check that fails
+    # under DeepSpeed ZeRO-3 where embedding weight is partitioned and
+    # weight.size(0) returns shard-local size instead of global vocab_size.
+    hidden_states = F.embedding(
+        batch.packed_input_ids, base_model.embed_tokens.weight
+    )
+
     position_ids = batch.logical_positions.unsqueeze(0)
     cos, sin = base_model.rotary_emb(hidden_states.unsqueeze(0), position_ids)
     cos, sin = cos.squeeze(0), sin.squeeze(0)
-    
+
     for layer in base_model.layers:
         residual = hidden_states
         hidden_states = layer.input_layernorm(hidden_states)
@@ -74,12 +80,12 @@ def wedlm_forward(
             layer.self_attn, hidden_states, cos, sin, batch, attn_wrapper, backend
         )
         hidden_states = residual + hidden_states
-        
+
         residual = hidden_states
         hidden_states = layer.post_attention_layernorm(hidden_states)
         hidden_states = layer.mlp(hidden_states)
         hidden_states = residual + hidden_states
-    
+
     hidden_states = base_model.norm(hidden_states)
     return lm_head(hidden_states)
 

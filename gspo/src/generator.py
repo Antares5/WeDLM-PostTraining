@@ -1,35 +1,30 @@
 # coding=utf-8
-"""On-policy generation engine wrapping wedlm.engine.LLMEngine."""
+"""On-policy generation engine using direct model WeDLM block decoding.
 
-import os
+Replaces the LLMEngine-based generation (which spawns new processes and
+conflicts with accelerate's distributed setup) with direct calls to the
+model's WeDLM decoding methods.
+"""
+
 import logging
 from typing import List, Dict, Optional, Any
+
 import torch
-import torch.distributed as dist
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Safeguard 1: disable torch.compile to avoid triton version incompatibility
-# (ImportError: cannot import name 'triton_key' from 'triton.compiler.compiler')
-# Must be set BEFORE importing wedlm modules that use @torch.compile.
-# ---------------------------------------------------------------------------
-os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
-try:
-    import torch._dynamo as dynamo
-    dynamo.config.disable = True
-except Exception:
-    pass
-
-from wedlm.engine.llm_engine import LLMEngine
-from wedlm.sampling_params import SamplingParams
+MASK_TOKEN_ID = 151665
+EOS_TOKEN_ID = 151645  # <|im_end|> for WeDLM tokenizer
 
 
 class WeDLMGenerator:
-    """Thin wrapper around wedlm.engine.LLMEngine for on-policy response generation.
+    """WeDLM block-decoding generator for on-policy response generation.
 
-    This class handles the WeDLM iterative decoding process during GSPO training,
-    generating K responses per prompt with diverse random seeds.
+    Uses the model's built-in WeDLM decoding (generate_wedlm if available,
+    or a manual block-decoding loop) instead of spawning LLMEngine processes.
+    This avoids NCCL device mismatch errors when running under accelerate
+    with DeepSpeed ZeRO-3.
     """
 
     def __init__(
@@ -47,34 +42,33 @@ class WeDLMGenerator:
             generation_config: Dict with max_new_tokens, temperature, top_p, top_k,
                                wedlm_entropy_threshold, wedlm_pos_penalty_factor.
             device: Target device.
-            model_path: Path to model directory (required for LLMEngine initialization).
+            model_path: Path to model directory (unused, kept for compatibility).
         """
         self.model = model
         self.tokenizer = tokenizer
         self.gen_config = generation_config
         self.device = device
-        self.model_path = model_path
+        self._model_path = model_path
 
-    def _build_sampling_params(self, seed: Optional[int] = None) -> SamplingParams:
-        """Build SamplingParams from generation config."""
-        return SamplingParams(
-            temperature=self.gen_config.get("temperature", 1.0),
-            top_p=self.gen_config.get("top_p", 1.0),
-            top_k=self.gen_config.get("top_k", 0),
-            max_tokens=self.gen_config.get("max_new_tokens", 512),
-            wedlm_entropy_threshold=self.gen_config.get(
-                "wedlm_entropy_threshold", 0.4
-            ),
-            wedlm_pos_penalty_factor=self.gen_config.get(
-                "wedlm_pos_penalty_factor", 0.02
-            ),
+        # Detect available generation method
+        self._use_builtin_generate = hasattr(self.model, "generate_wedlm")
+
+        # Resolve mask_token_id and eos_token_id
+        self.mask_token_id = MASK_TOKEN_ID
+        self.eos_token_id = getattr(
+            self.tokenizer, "eos_token_id", EOS_TOKEN_ID
         )
+        if self.eos_token_id is None:
+            self.eos_token_id = EOS_TOKEN_ID
+
+        # Block size for WeDLM decoding
+        self.block_size = 32
 
     @torch.no_grad()
     def generate(
         self, prompt_text: str, seed: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Generate a single response using the high-level LLMEngine.generate API.
+        """Generate a single response using WeDLM block decoding.
 
         Args:
             prompt_text: The prompt text (already formatted with chat template).
@@ -93,88 +87,194 @@ class WeDLMGenerator:
         if not prompt_ids:
             raise ValueError("Empty prompt after tokenization")
 
-        sampling_params = self._build_sampling_params(seed)
+        max_new_tokens = self.gen_config.get("max_new_tokens", 512)
+        temperature = self.gen_config.get("temperature", 1.0)
+        confidence_threshold = self.gen_config.get(
+            "wedlm_entropy_threshold", 0.4
+        )
 
-        # ------------------------------------------------------------------
-        # Safeguard 2: LLMEngine → ModelRunner._init_distributed() calls
-        # dist.init_process_group() unconditionally.  When running under
-        # accelerate, the process group is already initialized → double init
-        # error.  We temporarily replace init_process_group with a no-op.
-        # ------------------------------------------------------------------
-        _orig_init_pg = dist.init_process_group
-        if dist.is_initialized():
-            dist.init_process_group = lambda *a, **kw: None
+        if self._use_builtin_generate:
+            response_ids = self._generate_via_builtin(
+                prompt_ids, max_new_tokens, temperature, confidence_threshold
+            )
+        else:
+            response_ids = self._generate_via_loop(
+                prompt_ids, max_new_tokens, temperature, confidence_threshold
+            )
 
-        # ------------------------------------------------------------------
-        # Safeguard 3: ModelRunner._init_model() calls
-        # torch.set_default_device("cuda") and restores it on success, but
-        # if an exception occurs (e.g. triton), the restore is skipped,
-        # leaking "cuda" as the global default device for all future tensor
-        # creation (→ pin_memory crash).  We snapshot and forcibly restore.
-        # ------------------------------------------------------------------
-        _default_device = torch.get_default_device() if hasattr(torch, "get_default_device") else torch.device("cpu")
-        _default_dtype = torch.get_default_dtype()
-
-        try:
-            engine = LLMEngine(self.model_path or self.model)
-            try:
-                results = engine.generate(
-                    prompts=[prompt_text],
-                    sampling_params=sampling_params,
-                    use_tqdm=False,
-                )
-            finally:
-                engine.exit()
-        finally:
-            # Restore distributed init (even if we replaced it)
-            dist.init_process_group = _orig_init_pg
-            # Force-restore default device/dtype in case LLMEngine leaked "cuda"
-            try:
-                torch.set_default_device(_default_device)
-            except Exception:
-                pass
-            try:
-                torch.set_default_dtype(_default_dtype)
-            except Exception:
-                pass
-
-        if not results:
-            raise RuntimeError("Generation returned no results")
-
-        result = results[0]
-        response_text = result.get("text", "")
-        response_ids = result.get("token_ids", [])
-
-        return self._build_response(prompt_ids, response_ids, response_text)
-
-    def _build_response(
-        self,
-        prompt_ids: List[int],
-        response_ids: List[int],
-        response_text: str,
-    ) -> Dict[str, Any]:
-        """Build the output dict from prompt and response token IDs.
-
-        Args:
-            prompt_ids: Token IDs of the prompt.
-            response_ids: Token IDs of the generated response.
-            response_text: Decoded response text.
-
-        Returns:
-            Dict with input_ids, labels, text.
-        """
-        prompt_tensor = torch.tensor(prompt_ids, dtype=torch.long)
-        response_tensor = torch.tensor(response_ids, dtype=torch.long)
-
-        full_input_ids = torch.cat([prompt_tensor, response_tensor], dim=0)
-        labels = full_input_ids.clone()
-        labels[: len(prompt_ids)] = -100  # mask prompt tokens
+        response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
 
         return {
-            "input_ids": full_input_ids,
-            "labels": labels,
+            "input_ids": torch.cat([
+                torch.tensor(prompt_ids, dtype=torch.long),
+                torch.tensor(response_ids, dtype=torch.long),
+            ]),
+            "labels": torch.cat([
+                torch.full((len(prompt_ids),), -100, dtype=torch.long),
+                torch.tensor(response_ids, dtype=torch.long),
+            ]),
             "text": response_text,
         }
+
+    def _generate_via_builtin(
+        self,
+        prompt_ids: List[int],
+        max_new_tokens: int,
+        temperature: float,
+        confidence_threshold: float,
+    ) -> List[int]:
+        """Use model.generate_wedlm() if available."""
+        prompt_tensor = torch.tensor(
+            prompt_ids, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+
+        result = self.model.generate_wedlm(
+            input_ids=prompt_tensor,
+            max_new_tokens=max_new_tokens,
+            block_size=self.block_size,
+            mask_token_id=self.mask_token_id,
+            confidence_threshold=confidence_threshold,
+            temperature=temperature,
+            return_stats=False,
+        )
+
+        if isinstance(result, dict):
+            result = result.get("sequences", result.get("generated_ids", result))
+
+        if isinstance(result, torch.Tensor):
+            full_ids = result[0].tolist()
+            # Strip prompt
+            response_ids = full_ids[len(prompt_ids):]
+            # Remove trailing pad tokens and EOS
+            pad_id = getattr(self.tokenizer, "pad_token_id", None)
+            eos_id = self.eos_token_id
+            while response_ids:
+                last = response_ids[-1]
+                if last == pad_id or last == eos_id:
+                    response_ids.pop()
+                else:
+                    break
+            return response_ids
+
+        return []
+
+    def _generate_via_loop(
+        self,
+        prompt_ids: List[int],
+        max_new_tokens: int,
+        temperature: float,
+        confidence_threshold: float,
+    ) -> List[int]:
+        """Manual WeDLM block-decoding loop using model.forward().
+
+        Implements the block-wise mask-predict decoding:
+        1. Append a block of MASK tokens
+        2. Reorder (unmasked first, masked last) for causal mask
+        3. Forward pass → predict and fill confident positions
+        4. Repeat until max_new_tokens or EOS
+        """
+        device = self.device
+        block_size = self.block_size
+        eos_id = self.eos_token_id
+
+        current_ids = torch.tensor(prompt_ids, dtype=torch.long, device=device)
+        prefix_len = len(prompt_ids)
+        # Track ORIGINAL position for each token (needed for RoPE)
+        orig_positions = torch.arange(prefix_len, dtype=torch.long, device=device)
+        num_blocks = (max_new_tokens + block_size - 1) // block_size
+        next_pos = prefix_len
+
+        for block_idx in range(num_blocks):
+            remaining = max_new_tokens - block_idx * block_size
+            cur_block_size = min(block_size, remaining)
+
+            # 1. Append MASK tokens with their future positions
+            mask_tensor = torch.full(
+                (cur_block_size,), self.mask_token_id,
+                dtype=torch.long, device=device
+            )
+            mask_positions = torch.arange(
+                next_pos, next_pos + cur_block_size,
+                dtype=torch.long, device=device
+            )
+            current_ids = torch.cat([current_ids, mask_tensor])
+            orig_positions = torch.cat([orig_positions, mask_positions])
+            next_pos += cur_block_size
+
+            # 2. WeDLM iteration within this block
+            is_mask = (current_ids == self.mask_token_id)
+
+            for _ in range(cur_block_size):
+                if not is_mask.any():
+                    break
+
+                # Reorder: unmasked first, masked last (both tokens and positions)
+                reordered_ids = torch.cat([
+                    current_ids[~is_mask],
+                    current_ids[is_mask],
+                ])
+                reordered_positions = torch.cat([
+                    orig_positions[~is_mask],
+                    orig_positions[is_mask],
+                ])
+                input_ids = reordered_ids.unsqueeze(0)  # [1, L]
+                position_ids = reordered_positions.unsqueeze(0)  # [1, L]
+
+                # Forward pass with explicit position_ids for correct RoPE
+                outputs = self.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    use_cache=False,
+                )
+                logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+
+                # Get logits for masked positions (at the end of reordered sequence)
+                num_unmasked = (~is_mask).sum().item()
+                mask_logits = logits[0, num_unmasked:]  # [num_masked, V]
+
+                if mask_logits.size(0) == 0:
+                    break
+
+                # Apply temperature and get predictions
+                mask_logits = mask_logits / max(temperature, 1e-8)
+                probs = F.softmax(mask_logits, dim=-1)
+                max_probs, predicted_ids = probs.max(dim=-1)
+
+                # Confidence-based selection
+                if confidence_threshold > 0.0:
+                    confident = max_probs >= confidence_threshold
+                    if confident.any():
+                        fill_indices = confident.nonzero(as_tuple=True)[0]
+                    else:
+                        fill_indices = max_probs.argmax().unsqueeze(0)
+                else:
+                    fill_indices = max_probs.argmax().unsqueeze(0)
+
+                # Fill predicted tokens at original positions
+                mask_positions_orig = is_mask.nonzero(as_tuple=True)[0]
+                for idx in fill_indices:
+                    pos = mask_positions_orig[idx].item()
+                    current_ids[pos] = predicted_ids[idx].item()
+                    is_mask[pos] = False
+
+            # Check for EOS in generated tokens (any position after prefix)
+            if eos_id is not None:
+                new_tokens = current_ids[prefix_len:]
+                eos_positions = (new_tokens == eos_id).nonzero(as_tuple=True)
+                if eos_positions[0].numel() > 0:
+                    cutoff = eos_positions[0][0].item()
+                    response_ids = current_ids[prefix_len:prefix_len + cutoff]
+                    return response_ids.tolist()
+
+        # Return all generated tokens (strip trailing mask/EOS tokens)
+        response_ids_full = current_ids[prefix_len:].tolist()
+        while response_ids_full:
+            last = response_ids_full[-1]
+            if last == self.mask_token_id or last == eos_id:
+                response_ids_full.pop()
+            else:
+                break
+        return response_ids_full
 
     @torch.no_grad()
     def generate_batch(
