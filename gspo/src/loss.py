@@ -244,6 +244,9 @@ def compute_gspo_loss(
 
     device = policy_scores.device
 
+    # Ensure rewards are on the same device (math rewards come from CPU)
+    rewards = rewards.to(device)
+
     # Compute implied rewards from the difference between policy and reference scores
     pi_diff = policy_scores - reference_scores  # [K]
 
@@ -324,6 +327,9 @@ def compute_gspo_coefficients(
 
     if K < 2:
         return torch.zeros(K, device=device, dtype=policy_scores.dtype)
+
+    # Ensure rewards are on the same device (math rewards come from CPU)
+    rewards = rewards.to(device)
 
     pi_diff = policy_scores - reference_scores  # [K]
 
