@@ -101,6 +101,7 @@ class GSPOTrainer:
             self._ds_zero3_ctx = deepspeed.zero.Init()
         else:
             self._ds_zero3_ctx = None
+        self._model_kwargs = dict(model_kwargs)
 
         # Policy model
         with (self._ds_zero3_ctx or _NoOpContext()):
@@ -237,10 +238,23 @@ class GSPOTrainer:
                 self.ref_model, evaluation_mode=True
             )
         except Exception as err:
-            logger.warning(
-                f"Failed to prepare reference model with Accelerator ({err}), fallback to .to(device)."
-            )
-            self.ref_model = self.ref_model.to(self.accelerator.device)
+            if self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3:
+                logger.warning(
+                    "Failed to prepare reference model with Accelerator under ZeRO-3; "
+                    "reloading ref model without ZeRO-3 init."
+                )
+                ref_model_path = self.config.gspo_ref_model_path or self.config.model_path
+                self.ref_model = AutoModelForCausalLM.from_pretrained(
+                    ref_model_path, **self._model_kwargs
+                )
+                for param in self.ref_model.parameters():
+                    param.requires_grad = False
+                self.ref_model = self.ref_model.to(self.accelerator.device)
+            else:
+                logger.warning(
+                    f"Failed to prepare reference model with Accelerator ({err}), fallback to .to(device)."
+                )
+                self.ref_model = self.ref_model.to(self.accelerator.device)
         self.ref_model.eval()
 
         # Initialize generator with unwrapped model
@@ -262,10 +276,12 @@ class GSPOTrainer:
         self, model: torch.nn.Module, batch: WeDLMBatch
     ) -> torch.Tensor:
         """Forward helper for WeDLM logits."""
-        try:
-            forward_model = self.accelerator.unwrap_model(model)
-        except Exception:
-            forward_model = model
+        forward_model = model
+        if not (self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3):
+            try:
+                forward_model = self.accelerator.unwrap_model(model)
+            except Exception:
+                forward_model = model
         return wedlm_forward(
             forward_model, batch, self.attn_wrapper, self.config.attention_backend
         )

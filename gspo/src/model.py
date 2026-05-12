@@ -59,8 +59,9 @@ def wedlm_forward(
     backend: str,
 ) -> torch.Tensor:
     """Full forward pass with WeDLM attention pattern."""
-    base_model = model.model if hasattr(model, "model") else model
-    lm_head = model.lm_head
+    root_model = model.module if hasattr(model, "module") else model
+    base_model = root_model.model if hasattr(root_model, "model") else root_model
+    lm_head = root_model.lm_head if hasattr(root_model, "lm_head") else base_model.lm_head
 
     # Use module forward (embed_tokens.__call__) to trigger DeepSpeed ZeRO-3
     # parameter-gathering hooks. Direct F.embedding(weight) bypasses these
