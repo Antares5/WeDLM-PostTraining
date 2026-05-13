@@ -232,30 +232,16 @@ class GSPOTrainer:
                 self.model, self.optimizer, self.train_dataloader, self.lr_scheduler
             )
 
-        # Prepare ref model
+        # Prepare ref model (keep raw, NOT through DeepSpeed)
+        # ZeRO-2 already replicates model params on all GPUs, so DeepSpeed
+        # wrapping adds zero benefit and causes GPU-0 memory concentration
+        # due to engine hooks + all-reduce coordinator overhead.
         try:
-            self.ref_model = self.accelerator.prepare_model(
-                self.ref_model, evaluation_mode=True
-            )
+            self.ref_model = self.ref_model.to(self.accelerator.device)
         except Exception as err:
-            if self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3:
-                logger.warning(
-                    "Failed to prepare reference model with Accelerator under ZeRO-3; "
-                    "reloading ref model without ZeRO-3 init."
-                )
-                ref_model_path = self.config.gspo_ref_model_path or self.config.model_path
-                self.ref_model = AutoModelForCausalLM.from_pretrained(
-                    ref_model_path, **self._model_kwargs
-                )
-                for param in self.ref_model.parameters():
-                    param.requires_grad = False
-                self.ref_model = self.ref_model.to(self.accelerator.device)
-            else:
-                logger.warning(
-                    f"Failed to prepare reference model with Accelerator ({err}), fallback to .to(device)."
-                )
-                self.ref_model = self.ref_model.to(self.accelerator.device)
+            logger.warning(f"Failed to move ref model to device ({err})")
         self.ref_model.eval()
+        logger.info(f"Reference model on {self.accelerator.device} (raw, no DeepSpeed wrapper)")
 
         # Initialize generator with unwrapped model
         unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -402,6 +388,9 @@ class GSPOTrainer:
                 all_responses.append(prompt_responses)
 
         self.model.train()
+        # Clear CUDA cache after generation to free intermediate tensors
+        # (WeDLM block decoding allocates large logit/prob tensors per step)
+        torch.cuda.empty_cache()
 
         # ===== Phase 2: Math Reward Scoring (no_grad) =====
         with torch.no_grad():
@@ -422,6 +411,7 @@ class GSPOTrainer:
             rewards = torch.stack(rewards, dim=0)  # [bs, K]
 
         # ===== Phase 3: Reference Scoring (no_grad) =====
+        # Use raw ref model (not DeepSpeed-wrapped) for lower memory overhead
         ref_scores = []  # [bs, K]
         with torch.no_grad():
             for responses in all_responses:
@@ -436,6 +426,9 @@ class GSPOTrainer:
                     prompt_ref_scores.append(score)
                 ref_scores.append(torch.stack(prompt_ref_scores))
             ref_scores = torch.stack(ref_scores, dim=0)  # [bs, K]
+
+        # Clear after ref model forward (frees large intermediate tensors)
+        torch.cuda.empty_cache()
 
         # ===== Phase 4: Policy Scoring + Backward (grad) =====
         total_dpo_loss = torch.tensor(0.0, device=device)
@@ -495,6 +488,10 @@ class GSPOTrainer:
                             key, torch.tensor(0.0, device=device)
                         ) + value.detach()
 
+        # Cleanup phase 4 tensors
+        del ref_scores, all_responses, rewards
+        torch.cuda.empty_cache()
+
         # Average logs over batch
         denom = float(bs * num_mask_samples)
         avg_logs = {key: value / denom for key, value in total_logs.items()}
@@ -525,6 +522,17 @@ class GSPOTrainer:
             return compute_ar_loss(torch.cat(x0_logits), torch.cat(x0_labels))
         return torch.tensor(0.0, device=device), {}
 
+    def _calc_gpu_memory(self) -> str:
+        """Return a compact per-GPU memory usage string for debugging."""
+        if not torch.cuda.is_available():
+            return "cuda=N/A"
+        parts = []
+        for i in range(torch.cuda.device_count()):
+            alloc = torch.cuda.memory_allocated(i) / (1024**3)
+            reserved = torch.cuda.memory_reserved(i) / (1024**3)
+            parts.append(f"gpu{i}:{alloc:.1f}/{reserved:.1f}G")
+        return " ".join(parts)
+
     # ========== Main Training Loop ==========
 
     def train(self):
@@ -538,6 +546,10 @@ class GSPOTrainer:
             total=self.num_training_steps,
             disable=not self.accelerator.is_local_main_process,
         )
+
+        # Log initial GPU memory distribution
+        if self.accelerator.is_main_process:
+            logger.info(f"Initial GPU memory: {self._calc_gpu_memory()}")
 
         for epoch in range(self.config.num_train_epochs):
             # Use eval mode for deterministic two-phase gradient estimation
@@ -568,6 +580,7 @@ class GSPOTrainer:
                     )
 
                     if self.global_step % self.config.logging_steps == 0:
+                        logs["gpu_memory"] = self._calc_gpu_memory()
                         self._log_metrics(logs, epoch)
                     if self.global_step % self.config.save_steps == 0:
                         self._save_checkpoint()
@@ -581,13 +594,13 @@ class GSPOTrainer:
     def _log_metrics(self, logs: Dict, epoch: int):
         """Log metrics to console and wandb."""
         if self.accelerator.is_main_process:
-            log_str = f"Epoch {epoch} Step {self.global_step}: "
-            log_str += ", ".join(
-                f"{k}={v.item():.4f}"
-                for k, v in logs.items()
-                if isinstance(v, torch.Tensor) and v.numel() == 1
-            )
-            logger.info(log_str)
+            log_parts = [f"Epoch {epoch} Step {self.global_step}"]
+            for k, v in logs.items():
+                if isinstance(v, str):
+                    log_parts.append(f"{k}={v}")
+                elif isinstance(v, torch.Tensor) and v.numel() == 1:
+                    log_parts.append(f"{k}={v.item():.4f}")
+            logger.info(": ".join([log_parts[0], ", ".join(log_parts[1:])]))
 
             if self.wandb:
                 self.wandb.log(
