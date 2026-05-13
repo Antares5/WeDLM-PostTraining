@@ -19,8 +19,7 @@ from src import GSPOTrainingConfig, GSPOTrainer
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-# Disable DEBUG logs from WeDLM generation internals.
-logging.getLogger("hf_compat.modeling_wedlm").setLevel(logging.INFO)
+logging.disable(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
