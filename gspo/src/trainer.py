@@ -22,6 +22,7 @@ from src.loss import compute_ar_loss, compute_block_scores, compute_gspo_coeffic
 from src.attention import check_backend_available, get_available_backend, get_attention_wrapper
 from src.generator import WeDLMGenerator
 from src.reward import MathReward
+from src.buffer import RolloutBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +181,13 @@ class GSPOTrainer:
             tokenizer=self.tokenizer,
         )
 
+        # Rollout buffer (Phase 2)
+        buffer_size = max(self.config.gspo_buffer_size,
+                          self.config.gen_every_n_steps * self.config.per_device_train_batch_size)
+        self.rollout_buffer = RolloutBuffer(max_size=buffer_size)
+        self._step_in_gen_cycle = 0  # counter for gen_every_n_steps
+        self._ref_on_cpu = False
+
     def _prepare_training(self):
         """Prepare optimizer, scheduler, generator, and accelerator."""
         steps_per_epoch = len(self.train_dataloader)
@@ -255,6 +263,35 @@ class GSPOTrainer:
         )
 
         self.global_step = 0
+
+    # ========== Ref Model Offload (Phase 2) ==========
+
+    def _offload_ref_to_cpu(self):
+        """Offload reference model to CPU to free GPU memory during policy backward.
+
+        Only acts when config.ref_model_offload is True and ref is on GPU.
+        """
+        if not self.config.ref_model_offload:
+            return
+        if self._ref_on_cpu:
+            return
+        logger.debug("Offloading ref model to CPU...")
+        self.ref_model = self.ref_model.cpu()
+        self._ref_on_cpu = True
+        torch.cuda.empty_cache()
+
+    def _load_ref_to_gpu(self):
+        """Load reference model back to GPU for scoring.
+
+        Only acts when config.ref_model_offload is True and ref is on CPU.
+        """
+        if not self.config.ref_model_offload:
+            return
+        if not self._ref_on_cpu:
+            return
+        logger.debug("Loading ref model to GPU...")
+        self.ref_model = self.ref_model.to(self.accelerator.device)
+        self._ref_on_cpu = False
 
     # ========== Forward helpers ==========
 
@@ -338,12 +375,21 @@ class GSPOTrainer:
     def train_step_gspo(self, batch: Dict[str, Any]) -> tuple:
         """Single GSPO training step with 4-phase flow.
 
-        Phases:
-        1. Generation (no_grad): generate K responses per prompt
-        2. Reward scoring (no_grad): math rule-based binary reward
-        3. Reference scoring (no_grad): ref model block scores
-        4. Policy scoring + backward (grad): two-pass per-branch backward
+        When gen_every_n_steps == 1 (Phase 1 behavior):
+            Generate → Reward → Ref Score → Policy Backward (all inline)
+
+        When gen_every_n_steps > 1 (Phase 2 behavior):
+            Generate → Reward → Ref Score → Push to buffer → Train from buffer
         """
+        gen_every_n = self.config.gen_every_n_steps
+
+        if gen_every_n <= 1:
+            return self._train_step_gspo_full(batch)
+        else:
+            return self._train_step_with_buffer(batch)
+
+    def _train_step_gspo_full(self, batch: Dict[str, Any]) -> tuple:
+        """Full 4-phase GSPO step: generate + score + ref + backward (Phase 1 path)."""
         device = self.accelerator.device
         K = self.config.gspo_num_samples
         beta = float(self.config.gspo_beta)
@@ -351,16 +397,96 @@ class GSPOTrainer:
         sample_scale = 1.0 / float(num_mask_samples)
 
         # Extract batch data
-        prompt_messages_list = batch["messages"]  # List[List[Dict]]
-        ground_truths = batch["ground_truths"]  # List[str]
+        prompt_messages_list = batch["messages"]
+        ground_truths = batch["ground_truths"]
         bs = len(prompt_messages_list)
 
-        # Get properly formatted prompt texts
         prompt_texts = [self._get_prompt_text(msgs) for msgs in prompt_messages_list]
+
+        # ===== Phase 1-3: Generate + Score + Ref =====
+        all_responses, rewards, ref_scores = self._generate_and_score_batch(
+            prompt_texts, prompt_messages_list, ground_truths, K
+        )
+
+        # ===== Phase 4: Policy Scoring + Backward =====
+        return self._policy_train_on_responses(
+            all_responses, rewards, ref_scores, bs, K, beta,
+            num_mask_samples, sample_scale, device
+        )
+
+    def _train_step_with_buffer(self, batch: Dict[str, Any]) -> tuple:
+        """Train with rollout buffer: generate+push every N steps, always train from buffer.
+
+        The dataloader batch is only used for generation; training always
+        samples from the buffer to ensure on-policy freshness decay.
+        """
+        device = self.accelerator.device
+        K = self.config.gspo_num_samples
+        beta = float(self.config.gspo_beta)
+        num_mask_samples = max(int(self.config.gspo_num_mask_samples), 1)
+        sample_scale = 1.0 / float(num_mask_samples)
+
+        prompt_messages_list = batch["messages"]
+        ground_truths = batch["ground_truths"]
+        bs = len(prompt_messages_list)
+
+        # Track generation cycle
+        self._step_in_gen_cycle += 1
+        gen_every_n = self.config.gen_every_n_steps
+
+        if self._step_in_gen_cycle >= gen_every_n or len(self.rollout_buffer) == 0:
+            self._step_in_gen_cycle = 0
+            # === Generation step: generate K responses, score, push to buffer ===
+            prompt_texts = [self._get_prompt_text(msgs) for msgs in prompt_messages_list]
+            all_responses, rewards, ref_scores = self._generate_and_score_batch(
+                prompt_texts, prompt_messages_list, ground_truths, K
+            )
+            self.rollout_buffer.push_batch(
+                prompt_texts, prompt_messages_list, ground_truths,
+                all_responses, rewards, ref_scores
+            )
+            if self.accelerator.is_main_process:
+                logger.debug(
+                    f"Step {self.global_step}: generated {bs} prompts, "
+                    f"buffer size={len(self.rollout_buffer)}/{self.rollout_buffer.max_size}"
+                )
+        else:
+            # Non-generation step: discard dataloader batch, train from buffer only
+            pass
+
+        # === Train from buffer ===
+        try:
+            buf_batch = self.rollout_buffer.sample_batch(bs)
+        except (IndexError, RuntimeError) as e:
+            logger.warning(f"Cannot sample from buffer: {e}, returning zero loss")
+            device = self.accelerator.device
+            zero = torch.tensor(0.0, device=device, requires_grad=True)
+            return zero, {"loss": torch.tensor(0.0, device=device)}
+
+        return self._policy_train_on_responses(
+            buf_batch["all_responses"], buf_batch["rewards"], buf_batch["ref_scores"],
+            bs, K, beta, num_mask_samples, sample_scale, device
+        )
+
+    def _generate_and_score_batch(
+        self,
+        prompt_texts: List[str],
+        prompt_messages_list: List[List[Dict]],
+        ground_truths: List[str],
+        K: int,
+    ) -> Tuple[List[List[Dict]], torch.Tensor, torch.Tensor]:
+        """Phases 1-3: Generate K responses per prompt, compute rewards and ref scores.
+
+        Returns:
+            all_responses: List[bs][K] of response dicts
+            rewards: Tensor [bs, K]
+            ref_scores: Tensor [bs, K]
+        """
+        device = self.accelerator.device
 
         # ===== Phase 1: Generation (no_grad) =====
         self.model.eval()
-        all_responses = []  # [(input_ids, labels, text) × K] per prompt
+        all_responses = []
 
         with torch.no_grad():
             for prompt_text in prompt_texts:
@@ -374,7 +500,6 @@ class GSPOTrainer:
                         prompt_responses.append(response)
                     except Exception as e:
                         logger.warning(f"Generation failed for k={k}: {e}")
-                        # Create empty fallback response
                         prompt_ids = self.tokenizer.encode(
                             prompt_text, add_special_tokens=False
                         )
@@ -388,13 +513,11 @@ class GSPOTrainer:
                 all_responses.append(prompt_responses)
 
         self.model.train()
-        # Clear CUDA cache after generation to free intermediate tensors
-        # (WeDLM block decoding allocates large logit/prob tensors per step)
         torch.cuda.empty_cache()
 
         # ===== Phase 2: Math Reward Scoring (no_grad) =====
         with torch.no_grad():
-            rewards = []  # [bs, K]
+            rewards = []
             for prompt_text, responses, gt in zip(
                 prompt_texts, all_responses, ground_truths
             ):
@@ -402,7 +525,6 @@ class GSPOTrainer:
                 prompt_rewards = self.math_reward.compute_rewards(
                     [prompt_text] * K, response_texts, [gt] * K
                 )
-                # Normalize rewards within group
                 if prompt_rewards.std() > 1e-8 and prompt_rewards.numel() > 1:
                     prompt_rewards = (prompt_rewards - prompt_rewards.mean()) / (
                         prompt_rewards.std() + 1e-8
@@ -411,8 +533,10 @@ class GSPOTrainer:
             rewards = torch.stack(rewards, dim=0)  # [bs, K]
 
         # ===== Phase 3: Reference Scoring (no_grad) =====
-        # Use raw ref model (not DeepSpeed-wrapped) for lower memory overhead
-        ref_scores = []  # [bs, K]
+        # Ensure ref model is on GPU
+        self._load_ref_to_gpu()
+
+        ref_scores = []
         with torch.no_grad():
             for responses in all_responses:
                 prompt_ref_scores = []
@@ -427,17 +551,46 @@ class GSPOTrainer:
                 ref_scores.append(torch.stack(prompt_ref_scores))
             ref_scores = torch.stack(ref_scores, dim=0)  # [bs, K]
 
-        # Clear after ref model forward (frees large intermediate tensors)
+        # Offload ref to CPU after scoring to free GPU memory for policy backward
+        self._offload_ref_to_cpu()
         torch.cuda.empty_cache()
 
-        # ===== Phase 4: Policy Scoring + Backward (grad) =====
+        return all_responses, rewards, ref_scores
+
+    def _policy_train_on_responses(
+        self,
+        all_responses: List[List[Dict]],
+        rewards: torch.Tensor,
+        ref_scores: torch.Tensor,
+        bs: int,
+        K: int,
+        beta: float,
+        num_mask_samples: int,
+        sample_scale: float,
+        device: torch.device,
+    ) -> tuple:
+        """Phase 4: Policy scoring + per-branch backward on pre-computed responses.
+
+        Args:
+            all_responses: List[bs][K] of response dicts.
+            rewards: Tensor [bs, K] of pre-computed rewards.
+            ref_scores: Tensor [bs, K] of pre-computed ref scores.
+            bs, K: Batch size and number of samples per prompt.
+            beta: GSPO temperature.
+            num_mask_samples: Number of MC mask samples.
+            sample_scale: 1.0 / num_mask_samples.
+            device: Target device.
+
+        Returns:
+            (dummy_loss, avg_logs) tuple.
+        """
         total_dpo_loss = torch.tensor(0.0, device=device)
         total_logs: Dict[str, torch.Tensor] = {}
 
         for sample_idx in range(bs):
             sample_responses = all_responses[sample_idx]
-            sample_rewards = rewards[sample_idx]  # [K]
-            sample_ref = ref_scores[sample_idx]  # [K]
+            sample_rewards = rewards[sample_idx].to(device)  # [K]
+            sample_ref = ref_scores[sample_idx].to(device)  # [K]
 
             for _ in range(num_mask_samples):
                 # 4a. No-grad pass: get all K policy scores for coefficient computation
@@ -488,7 +641,6 @@ class GSPOTrainer:
                             key, torch.tensor(0.0, device=device)
                         ) + value.detach()
 
-        # Cleanup phase 4 tensors
         del ref_scores, all_responses, rewards
         torch.cuda.empty_cache()
 
@@ -497,7 +649,7 @@ class GSPOTrainer:
         avg_logs = {key: value / denom for key, value in total_logs.items()}
         avg_logs["loss"] = avg_logs.get("gspo/loss", torch.tensor(0.0, device=device))
 
-        # Compute a dummy loss for accelerator tracking (actual gradients already accumulated)
+        # Dummy loss for accelerator tracking (actual gradients already accumulated)
         dummy_loss = avg_logs["loss"].clone().detach().requires_grad_(True)
         return dummy_loss, avg_logs
 
@@ -536,10 +688,17 @@ class GSPOTrainer:
     # ========== Main Training Loop ==========
 
     def train(self):
-        """Main training loop for GSPO."""
+        """Main training loop for GSPO.
+
+        Two modes:
+        - gen_every_n_steps == 1: generate + train every step (Phase 1)
+        - gen_every_n_steps > 1: generate every N steps, train from buffer (Phase 2)
+        """
+        gen_every_n = self.config.gen_every_n_steps
         logger.info(
             f"Starting GSPO training: {len(self.train_dataloader)} batches per GPU, "
-            f"{self.num_training_steps} total update steps"
+            f"{self.num_training_steps} total update steps, "
+            f"gen_every_n={gen_every_n}"
         )
 
         progress_bar = tqdm(
@@ -547,18 +706,25 @@ class GSPOTrainer:
             disable=not self.accelerator.is_local_main_process,
         )
 
-        # Log initial GPU memory distribution
         if self.accelerator.is_main_process:
             logger.info(f"Initial GPU memory: {self._calc_gpu_memory()}")
+            if gen_every_n > 1:
+                logger.info(
+                    f"RolloutBuffer: size={self.rollout_buffer.max_size}, "
+                    f"generating every {gen_every_n} steps"
+                )
 
         for epoch in range(self.config.num_train_epochs):
-            # Use eval mode for deterministic two-phase gradient estimation
             self.model.eval()
 
             if self.train_sampler is not None:
                 self.train_sampler.set_epoch(epoch)
 
             for batch in self.train_dataloader:
+                # Phase 2: multi-GPU sync before generation (ensure different prompts per GPU)
+                if gen_every_n > 1 and self.accelerator.num_processes > 1:
+                    self.accelerator.wait_for_everyone()
+
                 with self.accelerator.accumulate(self.model):
                     loss, logs = self.train_step_gspo(batch)
 
@@ -581,6 +747,8 @@ class GSPOTrainer:
 
                     if self.global_step % self.config.logging_steps == 0:
                         logs["gpu_memory"] = self._calc_gpu_memory()
+                        if gen_every_n > 1:
+                            logs["buffer/size"] = len(self.rollout_buffer)
                         self._log_metrics(logs, epoch)
                     if self.global_step % self.config.save_steps == 0:
                         self._save_checkpoint()

@@ -31,6 +31,11 @@ gen_top_k: 0
 gen_wedlm_entropy_threshold: 0.4
 gen_wedlm_pos_penalty_factor: 0.02
 
+# ========== Phase 2: Rollout Buffer & Efficiency ==========
+gen_every_n_steps: 1                    # 1 = generate every step (Phase 1); >1 = rollout buffer (Phase 2)
+gspo_buffer_size: 16                    # max entries in rollout buffer
+ref_model_offload: false                # offload ref model to CPU between scoring passes
+
 # ========== WeDLM Structure ==========
 block_size: 32
 mask_per_block: true

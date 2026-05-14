@@ -88,6 +88,19 @@ def parse_args():
     parser.add_argument(
         "--gen_top_k", type=int, default=None, help="Top-k sampling"
     )
+    # Phase 2: Efficiency
+    parser.add_argument(
+        "--gen_every_n_steps", type=int, default=None,
+        help="Generate every N steps (1=every step, >1=rollout buffer)"
+    )
+    parser.add_argument(
+        "--gspo_buffer_size", type=int, default=None,
+        help="Rollout buffer max entries"
+    )
+    parser.add_argument(
+        "--ref_model_offload", action="store_true", default=None,
+        help="Offload ref model to CPU between scoring"
+    )
     # Training
     parser.add_argument(
         "--max_seq_length", type=int, default=None, help="Override max sequence length"
@@ -154,6 +167,8 @@ def main():
         "gen_temperature": args.gen_temperature,
         "gen_top_p": args.gen_top_p,
         "gen_top_k": args.gen_top_k,
+        "gen_every_n_steps": args.gen_every_n_steps,
+        "gspo_buffer_size": args.gspo_buffer_size,
         "max_seq_length": args.max_seq_length,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "output_dir": args.output_dir,
@@ -165,6 +180,8 @@ def main():
         if value is not None:
             setattr(config, key, value)
     config.rebuild_cache = args.rebuild_cache
+    if args.ref_model_offload is not None:
+        config.ref_model_offload = args.ref_model_offload
 
     # Setup DeepSpeed
     deepspeed_plugin = None

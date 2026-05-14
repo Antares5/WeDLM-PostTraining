@@ -41,6 +41,11 @@ class GSPOTrainingConfig:
     gen_wedlm_entropy_threshold: float = 0.4
     gen_wedlm_pos_penalty_factor: float = 0.02
 
+    # ========== Phase 2: Rollout Buffer & Efficiency ==========
+    gen_every_n_steps: int = 1              # 1 = generate every step (Phase 1); >1 = rollout buffer
+    gspo_buffer_size: int = 16              # max entries in rollout buffer
+    ref_model_offload: bool = False          # offload ref model to CPU between scoring passes
+
     # ========== WeDLM Structure ==========
     block_size: int = 32
     mask_per_block: bool = True
@@ -124,6 +129,12 @@ class GSPOTrainingConfig:
 
         if self.gspo_prompt_format not in ["messages", "deepmath"]:
             raise ValueError(f"Unknown gspo_prompt_format: {self.gspo_prompt_format}")
+
+        if self.gen_every_n_steps < 1:
+            raise ValueError("gen_every_n_steps must be >= 1")
+
+        if self.gspo_buffer_size < 1:
+            raise ValueError("gspo_buffer_size must be >= 1")
 
         if not self.mask_per_block:
             import warnings

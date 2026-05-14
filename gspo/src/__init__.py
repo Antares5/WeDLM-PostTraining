@@ -20,6 +20,7 @@ from src.attention import (
 )
 from src.generator import WeDLMGenerator
 from src.reward import MathReward
+from src.buffer import RolloutBuffer
 from src.trainer import GSPOTrainer
 
 __all__ = [
@@ -50,6 +51,8 @@ __all__ = [
     "WeDLMGenerator",
     # Reward
     "MathReward",
+    # Buffer
+    "RolloutBuffer",
     # Trainer
     "GSPOTrainer",
 ]
