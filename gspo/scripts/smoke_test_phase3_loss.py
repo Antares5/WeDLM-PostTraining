@@ -135,7 +135,7 @@ def test_edge_case_all_same_reward():
     rewards = torch.tensor([0.0, 0.0, 0.0])
 
     coeffs = compute_gspo_coefficients_with_kl(policy, ref, rewards, beta=0.1, kl_coef=0.0)
-    # Without KL, all-zero rewards => coeffs should be zero (no best/others contrast)
+    # All rewards identical → no meaningful best → coefficients are zero (no gradient)
     assert torch.allclose(coeffs, torch.zeros(3), atol=1e-6), f"coeffs={coeffs}"
 
     # With KL, there should still be KL contribution

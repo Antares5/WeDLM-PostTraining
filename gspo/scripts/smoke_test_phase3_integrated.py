@@ -133,12 +133,12 @@ def test_loss_edge_cases():
     assert torch.allclose(loss, torch.tensor(0.0)), f"K=1 loss={loss}"
     print("[PASS] K=1 returns zero loss")
 
-    # All rew 0 => no contrast, zero loss
+    # All rew 0 → no meaningful contrast → zero loss / zero coefficients
     loss, _ = compute_gspo_loss(
         torch.tensor([0.5, 0.6]), torch.tensor([0.4, 0.5]),
         torch.tensor([0.0, 0.0]), beta=0.1
     )
-    assert torch.allclose(loss, torch.tensor(0.0)), f"all-rew-0 loss={loss}"
+    assert torch.allclose(loss, torch.tensor(0.0), atol=1e-6), f"all-rew-0 loss={loss}"
     print("[PASS] All-zero rewards returns zero loss")
 
     # When chosen has higher score: loss should be < log(2)

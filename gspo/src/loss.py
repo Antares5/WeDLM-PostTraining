@@ -247,6 +247,20 @@ def compute_gspo_loss(
     # Ensure rewards are on the same device (math rewards come from CPU)
     rewards = rewards.to(device)
 
+    # If all rewards are identical, there is no meaningful "best" —
+    # return zero loss to avoid injecting noise into training.
+    if rewards.numel() > 1 and (rewards.max() - rewards.min()).abs() < 1e-8:
+        zero = torch.tensor(0.0, device=device, requires_grad=True)
+        return zero, {
+            "gspo/loss": torch.tensor(0.0, device=device),
+            "gspo/rewards_chosen": rewards.mean().detach(),
+            "gspo/rewards_rejected": torch.tensor(0.0, device=device),
+            "gspo/rewards_margin": torch.tensor(0.0, device=device),
+            "gspo/rewards_accuracy": torch.tensor(0.0, device=device),
+            "gspo/logits": torch.tensor(0.0, device=device),
+            "gspo/num_correct": torch.tensor(int((rewards > 0.5).sum().item()), device=device),
+        }
+
     # Compute implied rewards from the difference between policy and reference scores
     pi_diff = policy_scores - reference_scores  # [K]
 
@@ -260,7 +274,7 @@ def compute_gspo_loss(
     others = pi_diff[others_mask]  # [K-1]
 
     if others.numel() == 0:
-        # All rewards equal, no contrast possible
+        # Should not reach here given the K>=2 check above, but keep as safety
         zero = torch.tensor(0.0, device=device, requires_grad=True)
         return zero, {
             "gspo/loss": torch.tensor(0.0, device=device),
@@ -330,6 +344,11 @@ def compute_gspo_coefficients(
 
     # Ensure rewards are on the same device (math rewards come from CPU)
     rewards = rewards.to(device)
+
+    # If all rewards are identical, there is no meaningful "best" —
+    # return zero coefficients to avoid injecting noise into training.
+    if rewards.numel() > 1 and (rewards.max() - rewards.min()).abs() < 1e-8:
+        return torch.zeros(K, device=device, dtype=policy_scores.dtype)
 
     pi_diff = policy_scores - reference_scores  # [K]
 
