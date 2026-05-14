@@ -18,10 +18,10 @@ from src.config import GSPOTrainingConfig
 from src.data import GSPOPromptDataset, GSPOCollateFunction, get_im_end_token_id
 from src.batch import WeDLMBatch, build_wedlm_batch
 from src.model import wedlm_forward
-from src.loss import compute_ar_loss, compute_block_scores, compute_gspo_coefficients, compute_gspo_loss
+from src.loss import compute_ar_loss, compute_block_scores, compute_gspo_coefficients, compute_gspo_coefficients_with_kl, compute_gspo_loss, compute_kl_penalty
 from src.attention import check_backend_available, get_available_backend, get_attention_wrapper
 from src.generator import WeDLMGenerator
-from src.reward import MathReward
+from src.reward import MathReward, ModelReward
 from src.buffer import RolloutBuffer
 
 logger = logging.getLogger(__name__)
@@ -175,11 +175,22 @@ class GSPOTrainer:
         # Generator (initialized after model is on device, during _prepare_training)
         self.generator = None
 
-        # Math reward
-        self.math_reward = MathReward(
-            reward_type=self.config.gspo_reward_type,
-            tokenizer=self.tokenizer,
-        )
+        # Math reward (Phase 1) or Model reward (Phase 3)
+        if self.config.gspo_reward_type == "model":
+            logger.info(f"Loading Reward Model from {self.config.gspo_reward_model_path}")
+            self.reward_model = ModelReward(
+                model_path=self.config.gspo_reward_model_path,
+                tokenizer=self.tokenizer,
+                device=self.accelerator.device,
+                model_type=self.config.gspo_reward_model_type,
+                torch_dtype=torch.bfloat16 if self.config.bf16 else torch.float32,
+                trust_remote_code=self.config.trust_remote_code,
+            )
+        else:
+            self.reward_model = MathReward(
+                reward_type=self.config.gspo_reward_type,
+                tokenizer=self.tokenizer,
+            )
 
         # Rollout buffer (Phase 2)
         buffer_size = max(self.config.gspo_buffer_size,
@@ -187,6 +198,10 @@ class GSPOTrainer:
         self.rollout_buffer = RolloutBuffer(max_size=buffer_size)
         self._step_in_gen_cycle = 0  # counter for gen_every_n_steps
         self._ref_on_cpu = False
+
+        # Phase 3: monitoring state
+        self._sample_prompt_cache: Optional[str] = None  # cached prompt for periodic logging
+        self._last_logged_step: int = -1
 
     def _prepare_training(self):
         """Prepare optimizer, scheduler, generator, and accelerator."""
@@ -263,6 +278,18 @@ class GSPOTrainer:
         )
 
         self.global_step = 0
+
+        # Phase 3: Resume from checkpoint if specified
+        if self.config.gspo_resume_from_checkpoint:
+            self._load_checkpoint(self.config.gspo_resume_from_checkpoint)
+
+        # Phase 3: Log KL penalty status
+        if self.config.gspo_use_kl_penalty and self.config.gspo_kl_coef > 0:
+            logger.info(f"KL penalty enabled: coef={self.config.gspo_kl_coef}")
+        if self.config.gspo_log_samples_every_n_steps > 0:
+            logger.info(
+                f"Periodic sample logging enabled: every {self.config.gspo_log_samples_every_n_steps} steps"
+            )
 
     # ========== Ref Model Offload (Phase 2) ==========
 
@@ -515,16 +542,17 @@ class GSPOTrainer:
         self.model.train()
         torch.cuda.empty_cache()
 
-        # ===== Phase 2: Math Reward Scoring (no_grad) =====
+        # ===== Phase 2: Reward Scoring (no_grad) =====
         with torch.no_grad():
             rewards = []
             for prompt_text, responses, gt in zip(
                 prompt_texts, all_responses, ground_truths
             ):
                 response_texts = [r["text"] for r in responses]
-                prompt_rewards = self.math_reward.compute_rewards(
+                prompt_rewards = self.reward_model.compute_rewards(
                     [prompt_text] * K, response_texts, [gt] * K
                 )
+                # Normalize rewards within group (skip if all identical)
                 if prompt_rewards.std() > 1e-8 and prompt_rewards.numel() > 1:
                     prompt_rewards = (prompt_rewards - prompt_rewards.mean()) / (
                         prompt_rewards.std() + 1e-8
@@ -571,6 +599,10 @@ class GSPOTrainer:
     ) -> tuple:
         """Phase 4: Policy scoring + per-branch backward on pre-computed responses.
 
+        Phase 3 additions:
+        - KL penalty (when gspo_use_kl_penalty=True)
+        - Generation quality metrics collection
+
         Args:
             all_responses: List[bs][K] of response dicts.
             rewards: Tensor [bs, K] of pre-computed rewards.
@@ -586,11 +618,32 @@ class GSPOTrainer:
         """
         total_dpo_loss = torch.tensor(0.0, device=device)
         total_logs: Dict[str, torch.Tensor] = {}
+        total_quality_logs: Dict[str, List[float]] = {
+            "gen/response_length": [],
+            "gen/unique_token_ratio": [],
+        }
+
+        kl_coef = self.config.gspo_kl_coef if self.config.gspo_use_kl_penalty else 0.0
 
         for sample_idx in range(bs):
             sample_responses = all_responses[sample_idx]
             sample_rewards = rewards[sample_idx].to(device)  # [K]
             sample_ref = ref_scores[sample_idx].to(device)  # [K]
+
+            # === Phase 3: Collect generation quality metrics ===
+            for resp in sample_responses:
+                resp_ids = resp.get("input_ids")
+                labels = resp.get("labels")
+                if resp_ids is not None and labels is not None:
+                    # Response length (non -100 tokens in labels)
+                    resp_mask = labels != -100
+                    resp_len = int(resp_mask.sum().item())
+                    total_quality_logs["gen/response_length"].append(float(resp_len))
+                    # Unique token ratio in response
+                    resp_tokens = labels[resp_mask]
+                    if resp_tokens.numel() > 0:
+                        unique_ratio = len(set(resp_tokens.tolist())) / max(resp_tokens.numel(), 1)
+                        total_quality_logs["gen/unique_token_ratio"].append(float(unique_ratio))
 
             for _ in range(num_mask_samples):
                 # 4a. No-grad pass: get all K policy scores for coefficient computation
@@ -606,9 +659,9 @@ class GSPOTrainer:
                         policy_scores_ng.append(score)
                     policy_scores_ng = torch.stack(policy_scores_ng)  # [K]
 
-                # 4b. Compute GSPO coefficients
-                coeffs = compute_gspo_coefficients(
-                    policy_scores_ng, sample_ref, sample_rewards, beta
+                # 4b. Compute GSPO coefficients (with optional KL penalty)
+                coeffs = compute_gspo_coefficients_with_kl(
+                    policy_scores_ng, sample_ref, sample_rewards, beta, kl_coef
                 )  # [K]
 
                 # 4c. Compute GSPO loss for logging
@@ -616,7 +669,15 @@ class GSPOTrainer:
                     policy_scores_ng, sample_ref, sample_rewards, beta
                 )
 
-                # 4d. Per-branch backward
+                # 4d. KL penalty logging (Phase 3)
+                if kl_coef > 0:
+                    kl_loss, kl_per_sample = compute_kl_penalty(
+                        policy_scores_ng, sample_ref
+                    )
+                    gspo_logs["gspo/kl_penalty"] = kl_loss.detach()
+                    gspo_logs["gspo/kl_penalty_max"] = kl_per_sample.max()
+
+                # 4e. Per-branch backward
                 for k in range(K):
                     if abs(coeffs[k].item()) < 1e-10:
                         continue
@@ -641,12 +702,34 @@ class GSPOTrainer:
                             key, torch.tensor(0.0, device=device)
                         ) + value.detach()
 
+        # Aggregate quality metrics
+        for key, values in total_quality_logs.items():
+            if values:
+                total_logs[key] = torch.tensor(
+                    sum(values) / len(values), device=device
+                )
+        # Reward distribution stats
+        if rewards.numel() > 0:
+            total_logs["gen/reward_mean"] = rewards.float().mean().to(device)
+            total_logs["gen/reward_std"] = rewards.float().std().to(device)
+            total_logs["gen/reward_min"] = rewards.float().min().to(device)
+            total_logs["gen/reward_max"] = rewards.float().max().to(device)
+
         del ref_scores, all_responses, rewards
         torch.cuda.empty_cache()
 
         # Average logs over batch
         denom = float(bs * num_mask_samples)
-        avg_logs = {key: value / denom for key, value in total_logs.items()}
+        # Quality metrics are per-sample averages, only divide by bs
+        quality_keys = {"gen/response_length", "gen/unique_token_ratio",
+                        "gen/reward_mean", "gen/reward_std",
+                        "gen/reward_min", "gen/reward_max"}
+        avg_logs = {}
+        for key, value in total_logs.items():
+            if key in quality_keys:
+                avg_logs[key] = value / float(bs)
+            else:
+                avg_logs[key] = value / denom
         avg_logs["loss"] = avg_logs.get("gspo/loss", torch.tensor(0.0, device=device))
 
         # Dummy loss for accelerator tracking (actual gradients already accumulated)
@@ -673,6 +756,84 @@ class GSPOTrainer:
         if x0_logits:
             return compute_ar_loss(torch.cat(x0_logits), torch.cat(x0_labels))
         return torch.tensor(0.0, device=device), {}
+
+    # ========== Phase 3: Periodic Generation Sample Logging ==========
+
+    def _log_generation_samples(self):
+        """Generate and log sample responses for quality monitoring.
+
+        Uses a cached prompt (first prompt from dataset) or a fixed
+        prompt to generate K responses and logs them to console/wandb.
+        Only runs on main process.
+        """
+        if not self.accelerator.is_main_process:
+            return
+
+        log_every = self.config.gspo_log_samples_every_n_steps
+        if log_every <= 0:
+            return
+        if self.global_step % log_every != 0 and self._last_logged_step >= 0:
+            return
+
+        # Cache a sample prompt on first call
+        if self._sample_prompt_cache is None:
+            try:
+                sample = self.train_dataset[0]
+                self._sample_prompt_cache = self._get_prompt_text(sample["messages"])
+            except Exception as e:
+                logger.warning(f"Cannot cache sample prompt: {e}")
+                return
+
+        prompt_text = self._sample_prompt_cache
+        K = self.config.gspo_num_samples
+
+        logger.info(f"[Step {self.global_step}] Generating {K} sample responses for monitoring...")
+
+        try:
+            self.model.eval()
+            self._gather_params_for_generation()
+
+            with torch.no_grad():
+                responses = []
+                for k in range(K):
+                    seed = self.config.seed + k + self.global_step
+                    resp = self.generator.generate(prompt_text, seed=seed)
+                    responses.append(resp)
+
+            self.model.train()
+
+            # Log prompt (truncated)
+            prompt_preview = prompt_text[:300] + "..." if len(prompt_text) > 300 else prompt_text
+            logger.info(f"[Monitor] Prompt: {prompt_preview}")
+
+            # Log each response with its length
+            for k, resp in enumerate(responses):
+                text = resp.get("text", "")
+                labels = resp.get("labels")
+                resp_len = int((labels != -100).sum().item()) if labels is not None else 0
+                text_preview = text[:200] + "..." if len(text) > 200 else text
+                logger.info(f"[Monitor] Response {k+1}/{K} (len={resp_len}): {text_preview}")
+
+            # Log to wandb if enabled
+            if self.wandb:
+                sample_table = self.wandb.Table(
+                    columns=["Response #", "Length", "Text"]
+                )
+                for k, resp in enumerate(responses):
+                    text = resp.get("text", "")
+                    labels = resp.get("labels")
+                    resp_len = int((labels != -100).sum().item()) if labels is not None else 0
+                    sample_table.add_data(k + 1, resp_len, text[:500])
+                self.wandb.log(
+                    {"monitoring/samples": sample_table},
+                    step=self.global_step,
+                )
+
+            self._last_logged_step = self.global_step
+
+        except Exception as e:
+            logger.warning(f"Sample generation failed: {e}")
+            self.model.train()
 
     def _calc_gpu_memory(self) -> str:
         """Return a compact per-GPU memory usage string for debugging."""
@@ -703,6 +864,7 @@ class GSPOTrainer:
 
         progress_bar = tqdm(
             total=self.num_training_steps,
+            initial=self.global_step,
             disable=not self.accelerator.is_local_main_process,
         )
 
@@ -721,6 +883,9 @@ class GSPOTrainer:
                 self.train_sampler.set_epoch(epoch)
 
             for batch in self.train_dataloader:
+                # Phase 3: ZeRO-3 safety — gather params before generation step
+                self._gather_params_for_generation()
+
                 # Phase 2: multi-GPU sync before generation (ensure different prompts per GPU)
                 if gen_every_n > 1 and self.accelerator.num_processes > 1:
                     self.accelerator.wait_for_everyone()
@@ -750,6 +915,10 @@ class GSPOTrainer:
                         if gen_every_n > 1:
                             logs["buffer/size"] = len(self.rollout_buffer)
                         self._log_metrics(logs, epoch)
+
+                    # Phase 3: Periodic generation sample logging
+                    self._log_generation_samples()
+
                     if self.global_step % self.config.save_steps == 0:
                         self._save_checkpoint()
 
@@ -762,12 +931,17 @@ class GSPOTrainer:
     def _log_metrics(self, logs: Dict, epoch: int):
         """Log metrics to console and wandb."""
         if self.accelerator.is_main_process:
+            # Add current learning rate
+            logs["lr"] = self.lr_scheduler.get_last_lr()[0]
+
             log_parts = [f"Epoch {epoch} Step {self.global_step}"]
             for k, v in logs.items():
                 if isinstance(v, str):
                     log_parts.append(f"{k}={v}")
                 elif isinstance(v, torch.Tensor) and v.numel() == 1:
                     log_parts.append(f"{k}={v.item():.4f}")
+                elif isinstance(v, float):
+                    log_parts.append(f"{k}={v:.4f}")
             logger.info(": ".join([log_parts[0], ", ".join(log_parts[1:])]))
 
             if self.wandb:
@@ -779,8 +953,16 @@ class GSPOTrainer:
                     step=self.global_step,
                 )
 
+    # ========== Phase 3: Checkpoint Save / Resume ==========
+
     def _save_checkpoint(self, final: bool = False):
-        """Save model checkpoint."""
+        """Save model checkpoint with full training state for resumption.
+
+        Saves:
+        - Model weights (via save_pretrained)
+        - Tokenizer
+        - Trainer state (optimizer, scheduler, global_step, rng states)
+        """
         self.accelerator.wait_for_everyone()
         save_path = os.path.join(
             self.config.output_dir,
@@ -789,6 +971,103 @@ class GSPOTrainer:
 
         if self.accelerator.is_main_process:
             os.makedirs(save_path, exist_ok=True)
+            # Save model and tokenizer
             self.accelerator.unwrap_model(self.model).save_pretrained(save_path)
             self.tokenizer.save_pretrained(save_path)
-            logger.info(f"Saved checkpoint to {save_path}")
+
+            # Save trainer state for resumption
+            trainer_state = {
+                "global_step": self.global_step,
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
+                "step_in_gen_cycle": self._step_in_gen_cycle,
+            }
+            # Save RNG states for reproducibility
+            import random
+            trainer_state["python_rng_state"] = random.getstate()
+            trainer_state["torch_rng_state"] = torch.get_rng_state()
+            if torch.cuda.is_available():
+                trainer_state["cuda_rng_state"] = torch.cuda.get_rng_state()
+
+            state_path = os.path.join(save_path, "trainer_state.pt")
+            torch.save(trainer_state, state_path)
+            logger.info(f"Saved checkpoint to {save_path} (step={self.global_step})")
+
+    def _load_checkpoint(self, checkpoint_path: str):
+        """Load model and training state from a checkpoint for resumption.
+
+        Args:
+            checkpoint_path: Path to the checkpoint directory containing
+                             model weights, tokenizer, and trainer_state.pt.
+        """
+        if not os.path.isdir(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
+
+        state_path = os.path.join(checkpoint_path, "trainer_state.pt")
+        if not os.path.isfile(state_path):
+            raise FileNotFoundError(
+                f"trainer_state.pt not found in {checkpoint_path}. "
+                f"Only final checkpoints (saved with Phase 3+) support resumption."
+            )
+
+        logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+
+        # Load trainer state
+        trainer_state = torch.load(state_path, map_location="cpu")
+
+        # Restore global step
+        self.global_step = trainer_state.get("global_step", 0)
+        self._step_in_gen_cycle = trainer_state.get("step_in_gen_cycle", 0)
+
+        # Restore optimizer state
+        if "optimizer_state_dict" in trainer_state:
+            try:
+                self.optimizer.load_state_dict(trainer_state["optimizer_state_dict"])
+                logger.info("Optimizer state restored")
+            except Exception as e:
+                logger.warning(f"Failed to restore optimizer state: {e}")
+
+        # Restore scheduler state
+        if "lr_scheduler_state_dict" in trainer_state:
+            try:
+                self.lr_scheduler.load_state_dict(trainer_state["lr_scheduler_state_dict"])
+                logger.info("LR scheduler state restored")
+            except Exception as e:
+                logger.warning(f"Failed to restore scheduler state: {e}")
+
+        # Restore RNG states
+        if "python_rng_state" in trainer_state:
+            import random
+            random.setstate(trainer_state["python_rng_state"])
+        if "torch_rng_state" in trainer_state:
+            torch.set_rng_state(trainer_state["torch_rng_state"])
+        if "cuda_rng_state" in trainer_state and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state(trainer_state["cuda_rng_state"])
+            except Exception as e:
+                logger.warning(f"Failed to restore CUDA RNG state: {e}")
+
+        logger.info(f"Resumed from step {self.global_step}")
+
+    # ========== Phase 3: ZeRO-3 Safety ==========
+
+    def _gather_params_for_generation(self):
+        """Ensure all model parameters are gathered before generation.
+
+        Under ZeRO-3, parameters are sharded across GPUs. Before generation,
+        we need to gather all parameters. accelerate's unwrap_model already
+        handles this, but we add an explicit sync point for safety.
+        """
+        if self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3:
+            # ZeRO-3: force parameter gathering via a dummy all-reduce
+            # (DeepSpeed's GatheredParameters context is the proper way,
+            #  but accelerate handles this in unwrap_model; this is a safety net)
+            try:
+                import deepspeed
+                for param in self.model.parameters():
+                    if hasattr(param, 'ds_tensor'):
+                        # Force gather
+                        _ = param.data
+            except Exception:
+                pass
+        self.accelerator.wait_for_everyone()

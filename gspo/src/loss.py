@@ -446,3 +446,77 @@ def compute_ar_loss(
         "ar/loss": loss.detach(),
         "ar/num_tokens": torch.tensor(active_labels.numel(), device=device),
     }
+
+
+def compute_gspo_coefficients_with_kl(
+    policy_scores: torch.Tensor,
+    reference_scores: torch.Tensor,
+    rewards: torch.Tensor,
+    beta: float = 0.1,
+    kl_coef: float = 0.0,
+) -> torch.Tensor:
+    """Compute per-response gradient coefficients for GSPO loss with optional KL penalty.
+
+    Extends compute_gspo_coefficients with a KL divergence penalty between
+    policy and reference score distributions (Path C from the implementation plan).
+
+    The total coefficient for response i is:
+        coeff[i] = coeff_gspo[i] + coeff_kl[i]
+
+    where:
+        coeff_gspo[i] = ∂L_gspo/∂(policy_score_i)   (same as compute_gspo_coefficients)
+        coeff_kl[i]   = kl_coef * 2 * (policy_score_i - ref_score_i) / K
+                         (gradient of MSE between policy and ref scores)
+
+    Args:
+        policy_scores: [K] policy block scores (no-grad).
+        reference_scores: [K] reference block scores.
+        rewards: [K] binary/continuous rewards.
+        beta: GSPO temperature coefficient.
+        kl_coef: KL penalty coefficient (α in Path C). 0 = disabled.
+
+    Returns:
+        coefficients: [K] tensor, where coeff[i] = ∂L_total/∂(policy_score_i).
+    """
+    # Get base GSPO coefficients
+    coeffs = compute_gspo_coefficients(
+        policy_scores, reference_scores, rewards, beta
+    )
+
+    # Add KL penalty coefficients if enabled
+    if kl_coef > 0:
+        K = policy_scores.size(0)
+        device = policy_scores.device
+        dtype = policy_scores.dtype
+
+        # KL penalty: L_kl = kl_coef * mean((policy_scores - ref_scores)^2)
+        # ∂L_kl/∂(policy_score_i) = kl_coef * 2 * (policy_score_i - ref_score_i) / K
+        kl_grad = (2.0 * kl_coef / max(K, 1)) * (policy_scores - reference_scores.to(device))
+        coeffs = coeffs + kl_grad
+
+    return coeffs
+
+
+def compute_kl_penalty(
+    policy_scores: torch.Tensor,
+    reference_scores: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute KL divergence penalty between policy and reference score distributions.
+
+    Uses MSE as a practical proxy for KL divergence in block score space:
+        L_kl = mean((policy_scores - reference_scores)^2)
+
+    Args:
+        policy_scores: [K] policy block scores.
+        reference_scores: [K] reference block scores.
+
+    Returns:
+        kl_loss: Scalar KL penalty loss.
+        kl_per_sample: [K] per-sample KL values for logging.
+    """
+    device = policy_scores.device
+    ref = reference_scores.to(device)
+    diff = policy_scores - ref
+    kl_per_sample = diff * diff  # [K], squared difference per sample
+    kl_loss = kl_per_sample.mean()
+    return kl_loss, kl_per_sample.detach()

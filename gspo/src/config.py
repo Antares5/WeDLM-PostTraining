@@ -29,9 +29,20 @@ class GSPOTrainingConfig:
     gspo_length_norm: bool = True             # enable length normalization
     gspo_ref_model_path: Optional[str] = None # null = use model_path for ref
 
-    # ========== Reward (Phase 1: rule-based math) ==========
+    # ========== Reward (Phase 1: rule-based math; Phase 3: RM model) ==========
     gspo_reward_type: str = "math_verify"     # "math_verify" (Phase 1) / "model" (Phase 3)
     gspo_reward_model_path: Optional[str] = None  # only for reward_type="model"
+    gspo_reward_model_type: str = "auto"      # RM architecture: "auto", "sequence_classification", "causal_lm"
+
+    # ========== Phase 3: KL Constraint (Path C upgrade) ==========
+    gspo_use_kl_penalty: bool = False          # enable KL penalty in loss
+    gspo_kl_coef: float = 0.01                 # KL penalty coefficient (α in Path C)
+
+    # ========== Phase 3: Checkpoint Resume ==========
+    gspo_resume_from_checkpoint: Optional[str] = None  # path to checkpoint dir for resuming
+
+    # ========== Phase 3: Monitoring ==========
+    gspo_log_samples_every_n_steps: int = 100  # log sample generations every N steps (0 = disabled)
 
     # ========== Generation ==========
     gen_max_new_tokens: int = 512
@@ -126,6 +137,19 @@ class GSPOTrainingConfig:
 
         if self.gspo_reward_type not in ["math_verify", "model"]:
             raise ValueError(f"Unknown gspo_reward_type: {self.gspo_reward_type}")
+
+        if self.gspo_reward_model_type not in ["auto", "sequence_classification", "causal_lm"]:
+            raise ValueError(f"Unknown gspo_reward_model_type: {self.gspo_reward_model_type}")
+
+        if self.gspo_kl_coef < 0:
+            raise ValueError("gspo_kl_coef must be >= 0")
+
+        if self.gspo_log_samples_every_n_steps < 0:
+            raise ValueError("gspo_log_samples_every_n_steps must be >= 0")
+
+        # Validate RM model path when reward_type is "model"
+        if self.gspo_reward_type == "model" and not self.gspo_reward_model_path:
+            raise ValueError("gspo_reward_model_path is required when gspo_reward_type='model'")
 
         if self.gspo_prompt_format not in ["messages", "deepmath"]:
             raise ValueError(f"Unknown gspo_prompt_format: {self.gspo_prompt_format}")

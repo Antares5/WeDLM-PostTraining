@@ -138,6 +138,36 @@ def parse_args():
         default=None,
         help="Reward type",
     )
+    # Phase 3: RM model
+    parser.add_argument(
+        "--gspo_reward_model_path", type=str, default=None,
+        help="Reward model path (for reward_type='model')"
+    )
+    parser.add_argument(
+        "--gspo_reward_model_type", type=str,
+        choices=["auto", "sequence_classification", "causal_lm"],
+        default=None,
+        help="Reward model architecture"
+    )
+    # Phase 3: KL penalty
+    parser.add_argument(
+        "--gspo_use_kl_penalty", action="store_true", default=None,
+        help="Enable KL penalty in GSPO loss (Path C)"
+    )
+    parser.add_argument(
+        "--gspo_kl_coef", type=float, default=None,
+        help="KL penalty coefficient"
+    )
+    # Phase 3: Checkpoint resume
+    parser.add_argument(
+        "--resume_from_checkpoint", type=str, default=None,
+        help="Resume training from checkpoint directory"
+    )
+    # Phase 3: Monitoring
+    parser.add_argument(
+        "--gspo_log_samples_every_n_steps", type=int, default=None,
+        help="Log sample generations every N steps (0=disabled)"
+    )
     return parser.parse_args()
 
 
@@ -175,6 +205,11 @@ def main():
         "attention_backend": args.attention_backend,
         "loss_weighting_scheme": args.loss_weighting_scheme,
         "gspo_reward_type": args.reward_type,
+        "gspo_reward_model_path": args.gspo_reward_model_path,
+        "gspo_reward_model_type": args.gspo_reward_model_type,
+        "gspo_kl_coef": args.gspo_kl_coef,
+        "gspo_resume_from_checkpoint": args.resume_from_checkpoint,
+        "gspo_log_samples_every_n_steps": args.gspo_log_samples_every_n_steps,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -182,6 +217,8 @@ def main():
     config.rebuild_cache = args.rebuild_cache
     if args.ref_model_offload is not None:
         config.ref_model_offload = args.ref_model_offload
+    if args.gspo_use_kl_penalty is not None:
+        config.gspo_use_kl_penalty = args.gspo_use_kl_penalty
 
     # Setup DeepSpeed
     deepspeed_plugin = None

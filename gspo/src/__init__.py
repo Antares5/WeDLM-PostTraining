@@ -12,6 +12,8 @@ from src.loss import (
     compute_block_scores,
     compute_gspo_loss,
     compute_gspo_coefficients,
+    compute_gspo_coefficients_with_kl,
+    compute_kl_penalty,
 )
 from src.attention import (
     check_backend_available,
@@ -19,7 +21,7 @@ from src.attention import (
     get_attention_wrapper,
 )
 from src.generator import WeDLMGenerator
-from src.reward import MathReward
+from src.reward import MathReward, ModelReward
 from src.buffer import RolloutBuffer
 from src.trainer import GSPOTrainer
 
@@ -43,6 +45,8 @@ __all__ = [
     "compute_block_scores",
     "compute_gspo_loss",
     "compute_gspo_coefficients",
+    "compute_gspo_coefficients_with_kl",
+    "compute_kl_penalty",
     # Attention
     "check_backend_available",
     "get_available_backend",
@@ -51,6 +55,7 @@ __all__ = [
     "WeDLMGenerator",
     # Reward
     "MathReward",
+    "ModelReward",
     # Buffer
     "RolloutBuffer",
     # Trainer
