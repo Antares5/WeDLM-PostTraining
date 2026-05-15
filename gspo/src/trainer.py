@@ -513,6 +513,7 @@ class GSPOTrainer:
 
         # ===== Phase 1: Generation (no_grad) =====
         self.model.eval()
+        self._gather_params_for_generation()  # ZeRO-3 safety: gather shards before reading weights
         all_responses = []
 
         with torch.no_grad():
@@ -762,8 +763,8 @@ class GSPOTrainer:
     def _log_generation_samples(self):
         """Generate and log sample responses for quality monitoring.
 
-        Uses a cached prompt (first prompt from dataset) or a fixed
-        prompt to generate K responses and logs them to console/wandb.
+        Designed to be called alongside checkpoint saves (not in the hot
+        path of every training step) to avoid blocking distributed training.
         Only runs on main process.
         """
         if not self.accelerator.is_main_process:
@@ -772,8 +773,10 @@ class GSPOTrainer:
         log_every = self.config.gspo_log_samples_every_n_steps
         if log_every <= 0:
             return
-        if self.global_step % log_every != 0 and self._last_logged_step >= 0:
+        if self.global_step % log_every != 0:
             return
+        if self._last_logged_step == self.global_step:
+            return  # already logged at this step (dedup guard)
 
         # Cache a sample prompt on first call
         if self._sample_prompt_cache is None:
@@ -876,6 +879,9 @@ class GSPOTrainer:
                     f"generating every {gen_every_n} steps"
                 )
 
+        # Phase 3: Log baseline generation samples before training starts
+        self._log_generation_samples()
+
         for epoch in range(self.config.num_train_epochs):
             self.model.eval()
 
@@ -883,9 +889,6 @@ class GSPOTrainer:
                 self.train_sampler.set_epoch(epoch)
 
             for batch in self.train_dataloader:
-                # Phase 3: ZeRO-3 safety — gather params before generation step
-                self._gather_params_for_generation()
-
                 # Phase 2: multi-GPU sync before generation (ensure different prompts per GPU)
                 if gen_every_n > 1 and self.accelerator.num_processes > 1:
                     self.accelerator.wait_for_everyone()
@@ -916,13 +919,14 @@ class GSPOTrainer:
                             logs["buffer/size"] = len(self.rollout_buffer)
                         self._log_metrics(logs, epoch)
 
-                    # Phase 3: Periodic generation sample logging
-                    self._log_generation_samples()
-
                     if self.global_step % self.config.save_steps == 0:
                         self._save_checkpoint()
 
         progress_bar.close()
+        # Phase 3: run generation sample logging at end of training (safe: all ranks alive)
+        self._log_generation_samples()
+        # Explicit barrier: ensure all ranks finish logging before final save
+        self.accelerator.wait_for_everyone()
         self._save_checkpoint(final=True)
         if self.wandb:
             self.wandb.finish()
@@ -1081,23 +1085,28 @@ class GSPOTrainer:
 
     # ========== Phase 3: ZeRO-3 Safety ==========
 
+    @torch.no_grad()
     def _gather_params_for_generation(self):
         """Ensure all model parameters are gathered before generation.
 
         Under ZeRO-3, parameters are sharded across GPUs. Before generation,
-        we need to gather all parameters. accelerate's unwrap_model already
-        handles this, but we add an explicit sync point for safety.
+        we use DeepSpeed's GatheredParameters context to gather all params
+        so the generator can read the full model weights.
+
+        This should ONLY be called right before generation, NOT in the main
+        training loop (barriers there cause distributed deadlocks).
         """
-        if self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3:
-            # ZeRO-3: force parameter gathering via a dummy all-reduce
-            # (DeepSpeed's GatheredParameters context is the proper way,
-            #  but accelerate handles this in unwrap_model; this is a safety net)
-            try:
-                import deepspeed
-                for param in self.model.parameters():
-                    if hasattr(param, 'ds_tensor'):
-                        # Force gather
-                        _ = param.data
-            except Exception:
-                pass
-        self.accelerator.wait_for_everyone()
+        if not (self.config.use_deepspeed and self.config.deepspeed_zero_stage == 3):
+            return
+        try:
+            import deepspeed
+            from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+            params_to_gather = [
+                p for p in self.model.parameters()
+                if hasattr(p, 'ds_status') and p.ds_status != ZeroParamStatus.NOT_AVAILABLE
+            ]
+            if params_to_gather:
+                with deepspeed.zero.GatheredParameters(params_to_gather, modifier_rank=0):
+                    pass  # params gathered within context; released on exit
+        except Exception as e:
+            logger.debug(f"ZeRO-3 param gather skipped: {e}")
