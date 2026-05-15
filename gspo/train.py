@@ -20,6 +20,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logging.disable(logging.DEBUG)
+logging.getLogger("hf_compat.modeling_wedlm").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
