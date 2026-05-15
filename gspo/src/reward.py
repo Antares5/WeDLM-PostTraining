@@ -34,6 +34,8 @@ class MathReward:
         """
         self.reward_type = reward_type
         self.tokenizer = tokenizer
+        self._debug_call_count = 0
+        self._debug_max_info_calls = 20  # first N calls use INFO, rest use DEBUG
 
         if reward_type not in ["math_verify", "model"]:
             raise ValueError(f"Unknown reward_type: {reward_type}")
@@ -76,17 +78,38 @@ class MathReward:
         Returns:
             1.0 if the answer is correct, 0.0 otherwise.
         """
+        self._debug_call_count += 1
+        verbose = self._debug_call_count <= self._debug_max_info_calls
+
         if not response or not response.strip():
+            if verbose:
+                logger.info("Reward=0.0 (empty response)")
             return 0.0
 
         if not ground_truth or not ground_truth.strip():
+            if verbose:
+                logger.info("Reward=0.0 (empty ground_truth)")
             return 0.0
 
         extracted = self.extract_answer(response)
         if extracted is None:
+            if verbose:
+                logger.info(
+                    f"Reward=0.0 (no answer extracted) | "
+                    f"GT={ground_truth.strip()!r} | "
+                    f"Response[:200]={response[:200]!r}"
+                )
             return 0.0
 
-        return 1.0 if self.verify_answer(extracted, ground_truth.strip()) else 0.0
+        verified = self.verify_answer(extracted, ground_truth.strip())
+        reward = 1.0 if verified else 0.0
+        if verbose:
+            logger.info(
+                f"Reward={reward} | GT={ground_truth.strip()!r} | "
+                f"Extracted={extracted!r} | "
+                f"Response[:200]={response[:200]!r}"
+            )
+        return reward
 
     def extract_answer(self, text: str) -> Optional[str]:
         """Extract the final answer from a generated response.

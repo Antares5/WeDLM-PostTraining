@@ -26,7 +26,7 @@ gspo_ref_model_path: null               # null = use model_path for ref
 gspo_reward_type: "math_verify"         # "math_verify" for rule-based math reward
 
 # ========== Generation ==========
-gen_max_new_tokens: 512                 # max tokens to generate per response
+gen_max_new_tokens: 2048                 # max tokens to generate per response
 gen_temperature: 1.0                    # high temperature for diversity
 gen_top_p: 1.0
 gen_top_k: 0

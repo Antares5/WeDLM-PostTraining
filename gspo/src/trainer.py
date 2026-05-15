@@ -553,10 +553,21 @@ class GSPOTrainer:
                 prompt_rewards = self.reward_model.compute_rewards(
                     [prompt_text] * K, response_texts, [gt] * K
                 )
+                # Debug: log per-prompt reward summary before normalization
+                logger.info(
+                    f"Rewards raw: GT={gt!r} | values={prompt_rewards.tolist()} | "
+                    f"mean={prompt_rewards.mean().item():.3f} std={prompt_rewards.std().item():.3f}"
+                )
                 # Normalize rewards within group (skip if all identical)
                 if prompt_rewards.std() > 1e-8 and prompt_rewards.numel() > 1:
                     prompt_rewards = (prompt_rewards - prompt_rewards.mean()) / (
                         prompt_rewards.std() + 1e-8
+                    )
+                else:
+                    logger.warning(
+                        f"All rewards identical (std≈0) for GT={gt!r}, "
+                        f"values={prompt_rewards.tolist()}. "
+                        f"GSPO loss will be 0 for this prompt!"
                     )
                 rewards.append(prompt_rewards)
             rewards = torch.stack(rewards, dim=0)  # [bs, K]
