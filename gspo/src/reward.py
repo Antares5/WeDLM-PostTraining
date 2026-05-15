@@ -115,12 +115,15 @@ class MathReward:
         """Extract the final answer from a generated response.
 
         Attempts multiple extraction strategies in order:
-        1. GSM8K-style: '#### <number>'
-        2. MATH-style: '\\boxed{...}' (with nested-brace support)
-        3. LaTeX inline: '$...$' or '\\(...\\)' at end of text
+        1. MATH-style: '\\boxed{...}' (with nested-brace support) — PRIMARY
+        2. GSM8K-style: '#### <number>'
+        3. LaTeX inline: '$...$' or '\\(...\\)' anchored at end of text
         4. 'The answer is ...' / 'Answer: ...'
         5. Yes/No boolean answer (start or end of text)
-        6. Last numeric value in the text
+
+        Note: The non-anchored $...$ fallback and last-numeric-value strategies
+        are intentionally disabled for DeepMath to avoid false positives from
+        numbers appearing in problem statements.
 
         Args:
             text: Generated response text.
@@ -133,18 +136,18 @@ class MathReward:
 
         text = text.strip()
 
-        # Strategy 1: GSM8K format - "#### <number>"
-        match = re.search(r"####\s*(-?[\d,.\/]+)", text)
-        if match:
-            return self._normalize_numeric(match.group(1))
-
-        # Strategy 2: MATH format - "\boxed{...}" with nested brace support
+        # Strategy 1: MATH format - "\boxed{...}" with nested brace support (PRIMARY)
         boxed = self._extract_boxed(text)
         if boxed is not None:
             return boxed
 
-        # Strategy 3: LaTeX inline $...$ or \(...\) at the end of text
-        # Allow trailing punctuation (.,;:!?) and whitespace after the closing $
+        # Strategy 2: GSM8K format - "#### <number>"
+        match = re.search(r"####\s*(-?[\d,.\/]+)", text)
+        if match:
+            return self._normalize_numeric(match.group(1))
+
+        # Strategy 3: LaTeX inline $...$ or \(...\) at the VERY END of text
+        # Only anchored-at-end patterns to avoid false positives from mid-text math
         latex_patterns = [
             r"\$\$([^\$]+)\$\$[\s.,;:!?]*$",     # $$...$$ at end
             r"(?<!\\)\$([^\$]+)\$(?:\s*[.,;:!?]*\s*)$",  # $...$ at end (not escaped \$)
@@ -155,18 +158,7 @@ class MathReward:
             if match:
                 return match.group(1).strip()
 
-        # Fallback: find the LAST $...$ pair anywhere in text (non-anchored)
-        # Useful when answer is inline math not at the very end
-        inline_matches = re.findall(r"(?<!\\)\$([^\$]+)\$", text)
-        if inline_matches:
-            # Take the last one that has meaningful content
-            for candidate in reversed(inline_matches):
-                c = candidate.strip()
-                if c and len(c) >= 1:
-                    return c
-
         # Strategy 4: "The answer is ..." / "Answer: ..."
-        # Capture up to end of line (greedy), then trim trailing punctuation.
         patterns = [
             r"(?:the\s+)?answer\s+is\s*:?\s*([^\n]+)",
             r"answer\s*:\s*([^\n]+)",
@@ -184,19 +176,16 @@ class MathReward:
                     return candidate
 
         # Strategy 5: Yes/No boolean answer (start or end of text, word boundary)
-        # Check start of text
         bool_start = re.match(r"^(yes|no)\b", text, re.IGNORECASE)
         if bool_start:
             return bool_start.group(1).strip()
-        # Check end of text
         bool_end = re.search(r"\b(yes|no)[\s.,;:!?]*$", text, re.IGNORECASE)
         if bool_end:
             return bool_end.group(1).strip()
 
-        # Strategy 6: Last number in the text
-        numbers = re.findall(r"-?[\d,]+\.?\d*", text)
-        if numbers:
-            return numbers[-1]
+        # Strategy 6 (last numeric) and non-anchored $...$ fallback are
+        # INTENTIONALLY DISABLED — they cause false positives on DeepMath
+        # where problem statements contain numbers unrelated to the answer.
 
         return None
 

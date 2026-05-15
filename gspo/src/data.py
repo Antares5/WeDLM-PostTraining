@@ -251,10 +251,33 @@ class GSPOPromptDataset(Dataset):
             logger.warning("No ground truth found in item, skipping")
             return None
 
+        # ===== DeepMath: prepend \boxed{} formatting instruction =====
+        if self.prompt_format == "deepmath":
+            messages = self._inject_boxed_instruction(messages)
+
         return {
             "messages": messages,
             "ground_truth": ground_truth,
         }
+
+    def _inject_boxed_instruction(
+        self, messages: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """Prepend a system instruction requiring \boxed{} answer format.
+
+        Only adds if no existing system message already mentions \boxed.
+        """
+        BOXED_INSTRUCTION = (
+            "Put your final answer within \\boxed{}. "
+            "For Yes/No questions, output \\boxed{Yes} or \\boxed{No}."
+        )
+
+        # Check if any system message already contains \boxed instruction
+        for msg in messages:
+            if msg.get("role") == "system" and "\\boxed" in msg.get("content", ""):
+                return messages  # already has the instruction
+
+        return [{"role": "system", "content": BOXED_INSTRUCTION}] + messages
 
     def _build_messages_from_flat(self, item: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
         """Build messages list from flat columns (DeepMath format)."""
