@@ -780,7 +780,7 @@ class WeDLMForCausalLM(WeDLMPreTrainedModel, GenerationMixin):
         
         num_blocks = (max_new_tokens + block_size - 1) // block_size
         
-        logger.info(
+        logger.debug(
             f"Starting WeDLM generation: max_new_tokens={max_new_tokens}, block_size={block_size}, "
             f"confidence_threshold={confidence_threshold}, num_blocks={num_blocks}"
         )
@@ -862,7 +862,7 @@ class WeDLMForCausalLM(WeDLMPreTrainedModel, GenerationMixin):
         total_tokens = sum(s['total_tokens_generated'] for s in all_sample_stats)
         avg_tokens_per_step = total_tokens / total_steps if total_steps > 0 else 0
         
-        logger.info(
+        logger.debug(
             f"WeDLM generation completed: "
             f"total_steps={total_steps}, "
             f"total_tokens_generated={total_tokens}, "
