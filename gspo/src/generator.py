@@ -1,9 +1,9 @@
 # coding=utf-8
-"""On-policy generation engine using direct model WeDLM block decoding.
+"""On-policy generation engine using stochastic WeDLM block decoding.
 
-Replaces the LLMEngine-based generation (which spawns new processes and
-conflicts with accelerate's distributed setup) with direct calls to the
-model's WeDLM decoding methods.
+Uses a manual decode loop so K rollouts can diverge under different seeds.
+This keeps GSPO sampling stochastic even when the model exposes a greedy
+`generate_wedlm()` helper.
 """
 
 import logging
@@ -21,10 +21,9 @@ EOS_TOKEN_ID = 151645  # <|im_end|> for WeDLM tokenizer
 class WeDLMGenerator:
     """WeDLM block-decoding generator for on-policy response generation.
 
-    Uses the model's built-in WeDLM decoding (generate_wedlm if available,
-    or a manual block-decoding loop) instead of spawning LLMEngine processes.
-    This avoids NCCL device mismatch errors when running under accelerate
-    with DeepSpeed ZeRO-3.
+    The generator uses a manual block-decoding loop with stochastic token
+    sampling so repeated calls with different seeds can produce diverse K
+    responses for GSPO.
     """
 
     def __init__(
@@ -49,9 +48,6 @@ class WeDLMGenerator:
         self.gen_config = generation_config
         self.device = device
         self._model_path = model_path
-
-        # Detect available generation method
-        self._use_builtin_generate = hasattr(self.model, "generate_wedlm")
 
         # Resolve mask_token_id and eos_token_id
         self.mask_token_id = MASK_TOKEN_ID
@@ -92,15 +88,19 @@ class WeDLMGenerator:
         confidence_threshold = self.gen_config.get(
             "wedlm_entropy_threshold", 0.4
         )
+        top_p = float(self.gen_config.get("top_p", 1.0))
+        top_k = int(self.gen_config.get("top_k", 0))
 
-        if self._use_builtin_generate:
-            response_ids = self._generate_via_builtin(
-                prompt_ids, max_new_tokens, temperature, confidence_threshold
-            )
-        else:
-            response_ids = self._generate_via_loop(
-                prompt_ids, max_new_tokens, temperature, confidence_threshold
-            )
+        # Use the manual loop so sampling stays stochastic even if the model
+        # exposes a deterministic generate_wedlm() helper.
+        response_ids = self._generate_via_loop(
+            prompt_ids,
+            max_new_tokens,
+            temperature,
+            confidence_threshold,
+            top_p,
+            top_k,
+        )
 
         response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
 
@@ -158,12 +158,49 @@ class WeDLMGenerator:
 
         return []
 
+    def _sample_token_ids(
+        self,
+        logits: torch.Tensor,
+        greedy_ids: torch.Tensor,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """Sample one token per masked position from a filtered distribution."""
+        filtered_logits = logits.float().clone()
+        vocab_size = filtered_logits.size(-1)
+
+        if top_k > 0 and top_k < vocab_size:
+            top_k = min(top_k, vocab_size)
+            topk_values = torch.topk(filtered_logits, top_k, dim=-1).values[..., -1, None]
+            filtered_logits = filtered_logits.masked_fill(filtered_logits < topk_values, float("-inf"))
+
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(filtered_logits, descending=True, dim=-1)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = sorted_probs.cumsum(dim=-1)
+            sorted_indices_to_remove = cumulative_probs > top_p
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+
+            remove_mask = torch.zeros_like(filtered_logits, dtype=torch.bool)
+            remove_mask.scatter_(dim=-1, index=sorted_indices, src=sorted_indices_to_remove)
+            filtered_logits = filtered_logits.masked_fill(remove_mask, float("-inf"))
+
+        probs = F.softmax(filtered_logits, dim=-1)
+
+        if not torch.isfinite(probs).all() or (probs.sum(dim=-1) <= 0).any():
+            return greedy_ids
+
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
     def _generate_via_loop(
         self,
         prompt_ids: List[int],
         max_new_tokens: int,
         temperature: float,
         confidence_threshold: float,
+        top_p: float,
+        top_k: int,
     ) -> List[int]:
         """Manual WeDLM block-decoding loop using model.forward().
 
@@ -235,10 +272,17 @@ class WeDLMGenerator:
                 if mask_logits.size(0) == 0:
                     break
 
-                # Apply temperature and get predictions
+                # Apply temperature and score confidence before stochastic sampling.
                 mask_logits = mask_logits / max(temperature, 1e-8)
                 probs = F.softmax(mask_logits, dim=-1)
-                max_probs, predicted_ids = probs.max(dim=-1)
+                max_probs, greedy_ids = probs.max(dim=-1)
+
+                sampled_ids = self._sample_token_ids(
+                    mask_logits,
+                    greedy_ids,
+                    top_k=top_k,
+                    top_p=top_p,
+                )
 
                 # Confidence-based selection
                 if confidence_threshold > 0.0:
@@ -254,7 +298,7 @@ class WeDLMGenerator:
                 mask_positions_orig = is_mask.nonzero(as_tuple=True)[0]
                 for idx in fill_indices:
                     pos = mask_positions_orig[idx].item()
-                    current_ids[pos] = predicted_ids[idx].item()
+                    current_ids[pos] = sampled_ids[idx].item()
                     is_mask[pos] = False
 
             # Check for EOS in generated tokens (any position after prefix)
