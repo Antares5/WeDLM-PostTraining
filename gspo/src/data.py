@@ -134,8 +134,17 @@ class GSPOPromptDataset(Dataset):
 
         # Extract messages
         messages = item.get("messages")
+
+        # DeepMath parquet: 'prompt' column is already a list of {role, content} dicts
         if messages is None:
-            # Try DeepMath format: build messages from columns
+            prompt_val = item.get("prompt")
+            if isinstance(prompt_val, list) and len(prompt_val) > 0:
+                # Validate that entries look like message dicts
+                if all(isinstance(m, dict) and "role" in m and "content" in m for m in prompt_val):
+                    messages = prompt_val
+
+        if messages is None:
+            # Try flat-column format: build messages from columns
             messages = self._build_messages_from_flat(item)
 
         if not messages:

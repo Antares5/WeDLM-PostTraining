@@ -148,7 +148,147 @@ def test_empty_data():
         logger.info("✓ Empty data test PASSED")
 
 
+def test_deepmath_parquet():
+    """Test DeepMath parquet format (prompt column as list of {role, content} dicts)."""
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        logger.warning("pyarrow not installed, skipping DeepMath parquet test")
+        return
+
+    from src.data import GSPOPromptDataset, GSPOCollateFunction, get_im_end_token_id
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        data_path = os.path.join(tmpdir, "test_deepmath.parquet")
+
+        # Create parquet with DeepMath schema:
+        # prompt: list<struct<content: string, role: string>>
+        # solution: string
+        prompt_type = pa.list_(pa.struct([
+            ("content", pa.string()),
+            ("role", pa.string()),
+        ]))
+        schema = pa.schema([
+            ("prompt", prompt_type),
+            ("solution", pa.string()),
+        ])
+
+        data = [
+            {
+                "prompt": [{"content": "What is 2 + 2?", "role": "user"}],
+                "solution": "4",
+            },
+            {
+                "prompt": [{"content": "Solve: x^2 = 4. What is x?", "role": "user"}],
+                "solution": "$2$",
+            },
+            {
+                "prompt": [{"content": "Is pi greater than 3?", "role": "user"}],
+                "solution": "Yes",
+            },
+        ]
+        table = pa.Table.from_pylist(data, schema=schema)
+        pq.write_table(table, data_path)
+        logger.info(f"Created test DeepMath parquet: {len(data)} rows")
+
+        # Load tokenizer
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                "Qwen/Qwen2.5-0.5B", trust_remote_code=True
+            )
+        except Exception:
+            logger.warning("Cannot load test tokenizer, skipping DeepMath parquet test")
+            return
+
+        # Create dataset with deepmath format
+        dataset = GSPOPromptDataset(
+            data_path=data_path,
+            tokenizer=tokenizer,
+            max_seq_length=512,
+            prompt_format="deepmath",
+        )
+
+        logger.info(f"DeepMath dataset size: {len(dataset)}")
+        assert len(dataset) == 3, f"Expected 3 samples, got {len(dataset)}"
+
+        # Check all samples
+        for i in range(len(dataset)):
+            sample = dataset[i]
+            assert "input_ids" in sample
+            assert "ground_truth" in sample
+            logger.info(f"  Sample {i}: input_ids shape={sample['input_ids'].shape}, "
+                        f"ground_truth='{sample['ground_truth']}'")
+
+        # Verify ground truth extraction
+        assert dataset[0]["ground_truth"] == "4"
+        assert dataset[1]["ground_truth"] == "$2$"
+        assert dataset[2]["ground_truth"] == "Yes"
+
+        # Test collate function
+        im_end_id = get_im_end_token_id(tokenizer)
+        collate_fn = GSPOCollateFunction(pad_token_id=im_end_id)
+        batch = collate_fn([dataset[0], dataset[1], dataset[2]])
+        assert batch["input_ids"].dim() == 2
+        assert batch["input_ids"].size(0) == 3
+        assert len(batch["ground_truths"]) == 3
+
+        # Test DataLoader iteration
+        dataloader = DataLoader(
+            dataset, batch_size=2, collate_fn=collate_fn, shuffle=False
+        )
+        for i, batch in enumerate(dataloader):
+            logger.info(f"DeepMath Batch {i}: bs={batch['input_ids'].size(0)}, "
+                        f"ground_truths={batch['ground_truths']}")
+
+        logger.info("✓ DeepMath parquet test PASSED")
+
+
+def test_deepmath_reward():
+    """Test MathReward with DeepMath answer formats (LaTeX, Boolean)."""
+    from src.reward import MathReward
+
+    reward = MathReward(reward_type="math_verify")
+
+    # Test 1: LaTeX $...$ answer extraction
+    test_cases = [
+        # (response_text, ground_truth, expected_reward)
+        # DeepMath style: model outputs $...$ inline math
+        ("The limit evaluates to $0$.", "$0$", 1.0),
+        ("Therefore, the answer is $\\frac{1}{5}$.", "$\\frac{1}{5}$", 1.0),
+        ("The value is $\\sqrt{2\\pi}$.", "$\\sqrt{2\\pi}$", 1.0),
+        # Boolean answers
+        ("The construction is possible. So the answer is Yes.", "Yes", 1.0),
+        ("No such set exists. Therefore, no.", "No", 1.0),
+        # Boxed answers (model uses \boxed but ground truth is $...$)
+        ("The final answer is \\boxed{2}.", "$2$", 1.0),
+        # Numeric within tolerance
+        ("The answer is approximately 3.14159.", "3.1416", 1.0),
+        # Wrong answers
+        ("The answer is $5$.", "$3$", 0.0),
+        ("The limit is $1$.", "$0$", 0.0),
+    ]
+
+    for response, gt, expected in test_cases:
+        r = reward._compute_single_reward(response, gt)
+        status = "✓" if r == expected else "✗"
+        logger.info(f"  {status} reward={r} (expected={expected}): "
+                    f"response='{response[:60]}...' gt='{gt}'")
+        if r != expected:
+            logger.warning(f"    Extracted: '{reward.extract_answer(response)}'")
+            logger.warning(f"    Verified: {reward.verify_answer(reward.extract_answer(response), gt)}")
+
+    # Bulk assert
+    for response, gt, expected in test_cases:
+        r = reward._compute_single_reward(response, gt)
+        assert r == expected, f"Mismatch: response='{response[:50]}...' gt='{gt}' got={r} expected={expected}"
+
+    logger.info("✓ DeepMath reward test PASSED")
+
+
 if __name__ == "__main__":
     test_dataset()
     test_empty_data()
+    test_deepmath_parquet()
+    test_deepmath_reward()
     logger.info("All GSPO data tests passed!")

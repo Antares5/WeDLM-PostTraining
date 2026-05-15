@@ -93,9 +93,11 @@ class MathReward:
 
         Attempts multiple extraction strategies in order:
         1. GSM8K-style: '#### <number>'
-        2. MATH-style: '\\boxed{...}'
-        3. 'The answer is ...' / 'Answer: ...'
-        4. Last numeric value in the text
+        2. MATH-style: '\\boxed{...}' (with nested-brace support)
+        3. LaTeX inline: '$...$' or '\\(...\\)' at end of text
+        4. 'The answer is ...' / 'Answer: ...'
+        5. Yes/No boolean answer (start or end of text)
+        6. Last numeric value in the text
 
         Args:
             text: Generated response text.
@@ -113,33 +115,90 @@ class MathReward:
         if match:
             return self._normalize_numeric(match.group(1))
 
-        # Strategy 2: MATH format - "\boxed{...}"
-        match = re.findall(r"\\boxed\{([^}]*)\}", text)
-        if match:
-            # Take the last boxed expression
-            return match[-1].strip()
+        # Strategy 2: MATH format - "\boxed{...}" with nested brace support
+        boxed = self._extract_boxed(text)
+        if boxed is not None:
+            return boxed
 
-        # Strategy 3: "The answer is ..." / "Answer: ..."
+        # Strategy 3: LaTeX inline $...$ or \(...\) at the end of text
+        # Allow trailing punctuation (.,;:!?) and whitespace after the closing $
+        latex_patterns = [
+            r"\$\$([^\$]+)\$\$[\s.,;:!?]*$",     # $$...$$ at end
+            r"(?<!\\)\$([^\$]+)\$(?:\s*[.,;:!?]*\s*)$",  # $...$ at end (not escaped \$)
+            r"\\\(([^\)]+)\\\)[\s.,;:!?]*$",      # \(...\) at end
+        ]
+        for pat in latex_patterns:
+            match = re.search(pat, text)
+            if match:
+                return match.group(1).strip()
+
+        # Fallback: find the LAST $...$ pair anywhere in text (non-anchored)
+        # Useful when answer is inline math not at the very end
+        inline_matches = re.findall(r"(?<!\\)\$([^\$]+)\$", text)
+        if inline_matches:
+            # Take the last one that has meaningful content
+            for candidate in reversed(inline_matches):
+                c = candidate.strip()
+                if c and len(c) >= 1:
+                    return c
+
+        # Strategy 4: "The answer is ..." / "Answer: ..."
+        # Capture up to end of line (greedy), then trim trailing punctuation.
         patterns = [
-            r"(?:the\s+)?answer\s+is\s*:?\s*([^\n\.]+)",
-            r"answer\s*:\s*([^\n\.]+)",
+            r"(?:the\s+)?answer\s+is\s*:?\s*([^\n]+)",
+            r"answer\s*:\s*([^\n]+)",
             r"(?:=\s*)(-?[\d,.\/]+)\s*$",
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
                 candidate = match.group(1).strip()
-                # Remove trailing punctuation
-                candidate = re.sub(r"[.,;:!?]+$", "", candidate)
+                # Trim trailing sentence-ending punctuation and whitespace
+                candidate = re.sub(r"[.,;:!?\s]+$", "", candidate)
+                # Remove surrounding $ signs if present
+                candidate = candidate.strip("$")
                 if candidate:
                     return candidate
 
-        # Strategy 4: Last number in the text
+        # Strategy 5: Yes/No boolean answer (start or end of text, word boundary)
+        # Check start of text
+        bool_start = re.match(r"^(yes|no)\b", text, re.IGNORECASE)
+        if bool_start:
+            return bool_start.group(1).strip()
+        # Check end of text
+        bool_end = re.search(r"\b(yes|no)[\s.,;:!?]*$", text, re.IGNORECASE)
+        if bool_end:
+            return bool_end.group(1).strip()
+
+        # Strategy 6: Last number in the text
         numbers = re.findall(r"-?[\d,]+\.?\d*", text)
         if numbers:
             return numbers[-1]
 
         return None
+
+    def _extract_boxed(self, text: str) -> Optional[str]:
+        """Extract content inside \\boxed{...} with nested brace support.
+
+        Handles cases like \\boxed{\\frac{3}{4}} correctly.
+        """
+        # Find all occurrences of \boxed
+        best = None
+        for m in re.finditer(r"\\boxed\{", text):
+            start = m.end() - 1  # position of the opening {
+            # Brace-counting to find matching }
+            depth = 1
+            i = start + 1
+            while i < len(text) and depth > 0:
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                i += 1
+            if depth == 0:
+                # Content is between start+1 and i-1
+                best = text[start + 1 : i - 1].strip()
+        return best
 
     def _normalize_numeric(self, s: str) -> str:
         """Normalize a numeric string by removing commas and extra spaces."""
@@ -162,14 +221,28 @@ class MathReward:
         extracted = extracted.strip()
         ground_truth = ground_truth.strip()
 
+        # Strip $ signs from both sides (DeepMath LaTeX answers like "$1$")
+        ext_stripped = extracted.strip("$")
+        gt_stripped = ground_truth.strip("$")
+
         # Exact string match (case-insensitive)
-        if extracted.lower() == ground_truth.lower():
+        if ext_stripped.lower() == gt_stripped.lower():
             return True
 
-        # Try numeric comparison
+        # Boolean match (Yes/No, True/False) — case-insensitive
+        bool_values = {"yes", "no", "true", "false"}
+        ext_lower = ext_stripped.lower()
+        gt_lower = gt_stripped.lower()
+        if ext_lower in bool_values and gt_lower in bool_values:
+            # Map to canonical boolean
+            ext_bool = ext_lower in ("yes", "true")
+            gt_bool = gt_lower in ("yes", "true")
+            return ext_bool == gt_bool
+
+        # Try numeric comparison (on stripped values)
         try:
-            ext_num = float(self._normalize_numeric(extracted))
-            gt_num = float(self._normalize_numeric(ground_truth))
+            ext_num = float(self._normalize_numeric(ext_stripped))
+            gt_num = float(self._normalize_numeric(gt_stripped))
 
             # Tolerance-based comparison
             if gt_num == 0.0:
@@ -184,13 +257,56 @@ class MathReward:
         try:
             import sympy as sp
 
-            ext_expr = sp.simplify(extracted)
-            gt_expr = sp.simplify(ground_truth)
-            return sp.simplify(ext_expr - gt_expr) == 0
+            # Parse LaTeX-style expressions: strip $, convert \frac to rational
+            ext_expr = self._to_sympy(ext_stripped)
+            gt_expr = self._to_sympy(gt_stripped)
+            if ext_expr is not None and gt_expr is not None:
+                diff = sp.simplify(ext_expr - gt_expr)
+                return diff == 0
         except (ImportError, Exception):
             pass
 
         return False
+
+    def _to_sympy(self, s: str):
+        """Convert a LaTeX-ish math string to a SymPy expression.
+
+        Handles common patterns: \\frac{a}{b}, \\sqrt{x}, ^{...}, _{...},
+        and plain Python math expressions.
+        Returns None if parsing fails.
+        """
+        import sympy as sp
+
+        s = s.strip()
+        if not s:
+            return None
+
+        # Preprocess common LaTeX patterns to SymPy-compatible form
+        # \frac{a}{b} → (a)/(b)
+        s = re.sub(r"\\frac\{([^}]*)\}\{([^}]*)\}", r"(\1)/(\2)", s)
+        # \sqrt{x} → sqrt(x)
+        s = re.sub(r"\\sqrt\{([^}]*)\}", r"sqrt(\1)", s)
+        # \dfrac (same as \frac)
+        s = re.sub(r"\\dfrac\{([^}]*)\}\{([^}]*)\}", r"(\1)/(\2)", s)
+        # \pi → pi
+        s = s.replace("\\pi", "pi")
+        # \alpha, \beta → alpha, beta
+        for greek in ["alpha", "beta", "gamma", "delta", "epsilon", "theta",
+                       "lambda", "mu", "sigma", "omega", "phi", "psi"]:
+            s = s.replace(f"\\{greek}", greek)
+        # \emptyset → EmptySet
+        s = s.replace("\\emptyset", "EmptySet")
+        # Remove \, (thin space)
+        s = s.replace("\\,", "")
+        # ^{...} → **(...)  (exponent)
+        s = re.sub(r"\^\{([^}]*)\}", r"**(\1)", s)
+        # _{...} → _(...)  (subscript, may cause issues, remove for simplicity)
+        s = re.sub(r"_\{([^}]*)\}", r"", s)
+
+        try:
+            return sp.simplify(s)
+        except Exception:
+            return None
 
     def compute_batch_rewards(
         self,
