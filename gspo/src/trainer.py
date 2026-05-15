@@ -958,12 +958,15 @@ class GSPOTrainer:
     def _save_checkpoint(self, final: bool = False):
         """Save model checkpoint with full training state for resumption.
 
-        Saves:
-        - Model weights (via save_pretrained)
-        - Tokenizer
-        - Trainer state (optimizer, scheduler, global_step, rng states)
+        For the final checkpoint, only model weights + tokenizer are saved
+        (skipping optimizer state to avoid DeepSpeed all-gather hang when
+        GPU memory is tight).
+
+        For intermediate checkpoints, full trainer state is saved.
         """
-        self.accelerator.wait_for_everyone()
+        # Free GPU memory before saving to reduce OOM risk during all-gather
+        torch.cuda.empty_cache()
+
         save_path = os.path.join(
             self.config.output_dir,
             "final" if final else f"checkpoint-{self.global_step}",
@@ -971,17 +974,44 @@ class GSPOTrainer:
 
         if self.accelerator.is_main_process:
             os.makedirs(save_path, exist_ok=True)
+
+        # For final checkpoint: save model weights only (no all-gather needed)
+        # This avoids the DeepSpeed ZeRO-2 optimizer state_dict hang
+        if final:
+            if self.accelerator.is_main_process:
+                try:
+                    self.accelerator.unwrap_model(self.model).save_pretrained(
+                        save_path, safe_serialization=True
+                    )
+                    self.tokenizer.save_pretrained(save_path)
+                    logger.info(f"Saved final model to {save_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save final checkpoint: {e}")
+            # No wait_for_everyone for final save — avoid hang if a rank died
+            return
+
+        # Intermediate checkpoint: full state (needs all processes alive)
+        self.accelerator.wait_for_everyone()
+
+        if self.accelerator.is_main_process:
             # Save model and tokenizer
             self.accelerator.unwrap_model(self.model).save_pretrained(save_path)
             self.tokenizer.save_pretrained(save_path)
 
-            # Save trainer state for resumption
+            # Save trainer state for resumption (DeepSpeed optimizer is skipped)
             trainer_state = {
                 "global_step": self.global_step,
-                "optimizer_state_dict": self.optimizer.state_dict(),
                 "lr_scheduler_state_dict": self.lr_scheduler.state_dict(),
                 "step_in_gen_cycle": self._step_in_gen_cycle,
             }
+            # Only save optimizer state if NOT using DeepSpeed (DeepSpeed state_dict
+            # requires all ranks to participate in all-gather, can hang if OOM)
+            if not self.config.use_deepspeed:
+                try:
+                    trainer_state["optimizer_state_dict"] = self.optimizer.state_dict()
+                except Exception as e:
+                    logger.warning(f"Could not save optimizer state: {e}")
+
             # Save RNG states for reproducibility
             import random
             trainer_state["python_rng_state"] = random.getstate()
