@@ -106,22 +106,113 @@ class GSPOPromptDataset(Dataset):
         return samples
 
     def _load_parquet(self, data_path: str) -> List[Dict[str, Any]]:
-        """Load prompt data from Parquet file (DeepMath format)."""
+        """Load prompt data from Parquet file (DeepMath format).
+
+        Uses pyarrow directly for reliable nested-struct handling (pandas
+        may convert list<struct> columns to non-dict objects across different
+        versions/platforms). Falls back to pandas if pyarrow is unavailable.
+        """
+        # Prefer pyarrow: preserves nested structs as plain Python dicts
+        try:
+            import pyarrow.parquet as pq
+
+            table = pq.read_table(data_path)
+            column_names = table.column_names
+            logger.debug(
+                f"Parquet schema: {table.schema}, "
+                f"num_rows={table.num_rows}, columns={column_names}"
+            )
+
+            samples = []
+            # Batch-convert to Python objects for efficiency
+            rows = table.to_pylist()
+            for item in rows:
+                parsed = self._parse_item(item)
+                if parsed is not None:
+                    samples.append(parsed)
+
+            logger.debug(
+                f"Parquet parsed: {len(samples)} valid / {len(rows)} total rows"
+            )
+            if len(samples) == 0 and len(rows) > 0:
+                # Diagnostic: show the first row's structure
+                logger.warning(
+                    f"No valid samples parsed from parquet. "
+                    f"First row keys: {list(rows[0].keys()) if rows else 'N/A'}, "
+                    f"prompt type: {type(rows[0].get('prompt')) if rows else 'N/A'}"
+                )
+            return samples
+
+        except ImportError:
+            logger.debug("pyarrow not available, trying pandas...")
+
+        # Fallback: pandas (less reliable for nested list<struct> columns)
         try:
             import pandas as pd
         except ImportError:
-            raise ImportError("pandas is required for Parquet loading. Install with: pip install pandas pyarrow")
+            raise ImportError(
+                "Neither pyarrow nor pandas is installed. "
+                "Install one of them for Parquet loading: pip install pyarrow"
+            )
 
         df = pd.read_parquet(data_path)
-        samples = []
+        logger.debug(f"Pandas parquet: shape={df.shape}, columns={list(df.columns)}")
 
+        samples = []
         for _, row in df.iterrows():
             item = row.to_dict()
+            # Normalize: pandas may convert structs to non-dict objects
+            item = self._normalize_parquet_item(item)
             parsed = self._parse_item(item)
             if parsed is not None:
                 samples.append(parsed)
 
+        logger.debug(
+            f"Pandas parquet parsed: {len(samples)} valid / {len(df)} total rows"
+        )
         return samples
+
+    def _normalize_parquet_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a pandas parquet row: convert non-dict struct values to dicts.
+
+        pandas may convert pyarrow struct fields to tuples, OrderedDict,
+        or pyarrow scalar objects depending on version. This ensures the
+        'prompt' list-of-structs column is always a list of plain dicts.
+        """
+        normalized = {}
+        for key, value in item.items():
+            if value is None:
+                normalized[key] = value
+                continue
+
+            # Normalize list-of-structs: each struct must be a dict with str keys
+            if isinstance(value, (list, tuple)):
+                normalized_list = []
+                for elem in value:
+                    if isinstance(elem, dict):
+                        # Ensure all keys are strings (OrderedDict keys are fine)
+                        normalized_list.append({str(k): v for k, v in elem.items()})
+                    elif hasattr(elem, '_asdict'):
+                        # namedtuple
+                        normalized_list.append(elem._asdict())
+                    elif hasattr(elem, 'as_py'):
+                        # pyarrow scalar
+                        normalized_list.append(elem.as_py())
+                    elif hasattr(elem, '__dict__'):
+                        normalized_list.append(elem.__dict__)
+                    else:
+                        # Keep as-is, _parse_item will validate
+                        normalized_list.append(elem)
+                normalized[key] = normalized_list
+            elif hasattr(value, 'as_py'):
+                # pyarrow scalar
+                normalized[key] = value.as_py()
+            elif hasattr(value, '_asdict'):
+                # namedtuple
+                normalized[key] = value._asdict()
+            else:
+                normalized[key] = value
+        return normalized
 
     def _parse_item(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Parse a single data item into standardized format.
