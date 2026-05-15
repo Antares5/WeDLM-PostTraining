@@ -31,7 +31,25 @@ class _WeDLMGenerationLogFilter(logging.Filter):
         return True
 
 
-logging.getLogger().addFilter(_WeDLMGenerationLogFilter())
+_WEDLM_LOG_FILTER = _WeDLMGenerationLogFilter()
+
+
+def _install_wedlm_log_filter() -> None:
+    # Attach to root and any non-propagating loggers/handlers.
+    root_logger = logging.getLogger()
+    root_logger.addFilter(_WEDLM_LOG_FILTER)
+    for handler in root_logger.handlers:
+        handler.addFilter(_WEDLM_LOG_FILTER)
+
+    manager = logging.Logger.manager
+    for logger in manager.loggerDict.values():
+        if isinstance(logger, logging.Logger):
+            logger.addFilter(_WEDLM_LOG_FILTER)
+            for handler in logger.handlers:
+                handler.addFilter(_WEDLM_LOG_FILTER)
+
+
+_install_wedlm_log_filter()
 logging.disable(logging.DEBUG)
 logging.getLogger("hf_compat.modeling_wedlm").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
