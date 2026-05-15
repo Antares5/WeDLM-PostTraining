@@ -19,6 +19,19 @@ from src import GSPOTrainingConfig, GSPOTrainer
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
+
+
+class _WeDLMGenerationLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if "Starting WeDLM generation" in message:
+            return False
+        if "WeDLM generation completed" in message:
+            return False
+        return True
+
+
+logging.getLogger().addFilter(_WeDLMGenerationLogFilter())
 logging.disable(logging.DEBUG)
 logging.getLogger("hf_compat.modeling_wedlm").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
